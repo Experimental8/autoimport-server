@@ -3,17 +3,16 @@ const fetch = require('node-fetch');
 const fs    = require('fs');
 const http  = require('http');
 
-const DATA_FILE      = './data.json';
-const APIFY_TOKEN    = process.env.APIFY_TOKEN;
-const APIFY_AS24     = 'ivanvs/autoscout-scraper';
-const APIFY_MDE      = 'ivanvs/mobile-de-scraper';
-const APIFY_SV       = 'dadhalfdev/standvirtual-scraper';
+const DATA_FILE  = './data.json';
+const APIFY_TOKEN = process.env.APIFY_TOKEN;
+const APIFY_AS24 = 'ivanvs/autoscout-scraper';
+const APIFY_MDE  = 'ivanvs/mobile-de-scraper';
 
 // ── Persistence ───────────────────────────────────────────────────────────
 function loadData() {
-  if (!fs.existsSync(DATA_FILE)) return { analyses: [], favourites: [] };
+  if (!fs.existsSync(DATA_FILE)) return { analyses: [], notifications: [] };
   try { return JSON.parse(fs.readFileSync(DATA_FILE, 'utf8')); }
-  catch { return { analyses: [], favourites: [] }; }
+  catch { return { analyses: [], notifications: [] }; }
 }
 function saveData(data) { fs.writeFileSync(DATA_FILE, JSON.stringify(data, null, 2)); }
 
@@ -21,9 +20,9 @@ function saveData(data) { fs.writeFileSync(DATA_FILE, JSON.stringify(data, null,
 async function scrapeUrl(actorId, url, maxItems = 100) {
   const endpoint = `https://api.apify.com/v2/acts/${encodeURIComponent(actorId)}/run-sync-get-dataset-items`;
   const params = new URLSearchParams({ token: APIFY_TOKEN, maxItems, format: 'json' });
-  const input = actorId.includes('mobile-de')   ? { urls: [url], maxRecords: maxItems }
-              : actorId.includes('standvirtual') ? { startUrls: [{ url }], maxItems }
-              : { urls: [{ url }], maxRecords: maxItems };
+  const input = actorId.includes('mobile-de')
+    ? { urls: [url], maxRecords: maxItems }
+    : { urls: [{ url }], maxRecords: maxItems };
   const resp = await fetch(`${endpoint}?${params}`, {
     method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(input),
   });
@@ -31,7 +30,7 @@ async function scrapeUrl(actorId, url, maxItems = 100) {
   return resp.json();
 }
 
-// ── ntfy ──────────────────────────────────────────────────────────────────
+// ── ntfy + history ────────────────────────────────────────────────────────
 async function notify(channel, title, message, priority = 'default', analysisId = null) {
   if (!channel) return;
   try {
@@ -42,7 +41,7 @@ async function notify(channel, title, message, priority = 'default', analysisId 
     });
   } catch (e) { console.error('ntfy error:', e.message); }
 
-  // Save to history
+  // Save to history (7 days)
   const data = loadData();
   if (!data.notifications) data.notifications = [];
   data.notifications.push({
@@ -54,24 +53,33 @@ async function notify(channel, title, message, priority = 'default', analysisId 
     ts: new Date().toISOString(),
     read: false,
   });
-  // Keep 7 days only
   const cutoff = Date.now() - 7 * 24 * 60 * 60 * 1000;
   data.notifications = data.notifications.filter(n => new Date(n.ts).getTime() > cutoff);
   saveData(data);
 }
 
-// ── Sync ──────────────────────────────────────────────────────────────────
-function getId(row) { return row.url || row.id || null; }
+// ── Helpers ───────────────────────────────────────────────────────────────
+function getId(r) { return r.url || r.id || null; }
 
+function getPrice(r) {
+  const raw = r['price/amount'] || r.rawPrice || r.price || '';
+  const n = parseFloat(String(raw).replace(/[^0-9.]/g, ''));
+  return isNaN(n) ? null : n;
+}
+
+function getMake(r)  { return r.manufacturer || r.make || ''; }
+function getModel(r) { return r.model || ''; }
+function getKm(r)    { return r['properties/milage'] || r.milage || ''; }
+function fmt(n)      { return n != null ? n.toLocaleString('pt-PT') : '—'; }
+
+// ── Sync ──────────────────────────────────────────────────────────────────
 async function syncAnalysis(analysis) {
-  const { name, searchUrls, ntfyChannel } = analysis;
+  const { name, searchUrls, ntfyChannel, minScore = 0 } = analysis;
   if (!searchUrls?.length) return;
   console.log(`[${new Date().toISOString()}] Syncing: ${name}`);
 
-  const originUrls = searchUrls.filter(s => s.source !== 'sv');
   const freshOrigin = [];
-
-  for (const { url, source } of originUrls) {
+  for (const { url, source } of searchUrls.filter(s => s.source !== 'sv')) {
     try {
       const actor = source === 'mde' ? APIFY_MDE : APIFY_AS24;
       const rows  = await scrapeUrl(actor, url);
@@ -80,24 +88,69 @@ async function syncAnalysis(analysis) {
     } catch (e) { console.error(`  ${source} error:`, e.message); }
   }
 
-  const knownIds   = new Set(analysis.knownOriginIds || []);
-  const newListings = freshOrigin.filter(r => { const id = getId(r); return id && !knownIds.has(id); });
+  // knownListings: { [id]: { price, score } }
+  const knownListings = analysis.knownListings || {};
+  const newListings   = [];
+  const priceDrops    = [];
 
-  if (newListings.length > 0) {
-    console.log(`  → ${newListings.length} new listings`);
-    for (const r of newListings.slice(0, 5)) {
-      const make  = r.manufacturer || r.make || '';
-      const model = r.model || '';
-      const price = r['price/amount'] || r.rawPrice || r.price || '';
-      const km    = r['properties/milage'] || r.milage || '';
-      await notify(ntfyChannel, `🚗 Novo anúncio: ${name}`,
-        `${make} ${model} — ${price ? price+'€' : 'preço n/d'} — ${km}\n${r.url||''}`, 'high', analysis.id);
+  for (const r of freshOrigin) {
+    const id    = getId(r);
+    if (!id) continue;
+    const price = getPrice(r);
+    const score = r.score || r.pontuation || null;
+
+    if (!knownListings[id]) {
+      // Brand new listing — only notify if score >= minScore
+      if (minScore <= 0 || score == null || score >= minScore) {
+        newListings.push(r);
+      }
+      knownListings[id] = { price, score, firstSeen: new Date().toISOString() };
+    } else {
+      // Known listing — notify only if:
+      // was below minScore, price dropped, and now score >= minScore
+      const prev = knownListings[id];
+      const wasBelow = prev.score == null || (minScore > 0 && prev.score < minScore);
+      const priceDrop = price != null && prev.price != null && price < prev.price;
+      const nowAbove  = score != null && (minScore <= 0 || score >= minScore);
+
+      if (wasBelow && priceDrop && nowAbove) {
+        priceDrops.push({ r, prev, price, score });
+      }
+      knownListings[id] = { price, score, firstSeen: prev.firstSeen };
     }
-    freshOrigin.forEach(r => { const id = getId(r); if (id) knownIds.add(id); });
-    analysis.knownOriginIds = [...knownIds].slice(-2000);
-  } else {
-    console.log(`  → No new listings`);
   }
+
+  // 🚗 Novo anúncio com score acima do mínimo
+  if (newListings.length > 0) {
+    console.log(`  → ${newListings.length} new listings above min score`);
+    for (const r of newListings.slice(0, 5)) {
+      const price = getPrice(r);
+      const score = r.score || r.pontuation || '';
+      const msg = `${getMake(r)} ${getModel(r)} — ${price ? fmt(price)+'€' : 'preço n/d'} — ${getKm(r)}${score ? ' · Score '+score : ''}\n${getId(r)}`;
+      await notify(ntfyChannel, `🚗 Novo anúncio: ${name}`, msg, 'high', analysis.id);
+    }
+  } else {
+    console.log(`  → No new listings above min score`);
+  }
+
+  // 📉 Baixou de preço e passou o score mínimo
+  if (priceDrops.length > 0) {
+    console.log(`  → ${priceDrops.length} price drops now above min score`);
+    for (const { r, prev, price, score } of priceDrops.slice(0, 3)) {
+      const msg = `${getMake(r)} ${getModel(r)}\n💶 ${fmt(prev.price)}€ → ${fmt(price)}€ (−${fmt(prev.price - price)}€)${score ? ' · Score '+score : ''}\n${getId(r)}`;
+      await notify(ntfyChannel, `📉 Baixou de preço: ${name}`, msg, 'high', analysis.id);
+    }
+  }
+
+  // Prune knownListings to IDs still present (max 2000)
+  const freshIds = new Set(freshOrigin.map(getId).filter(Boolean));
+  const pruned = {};
+  for (const [id, val] of Object.entries(knownListings)) {
+    if (freshIds.has(id)) pruned[id] = val;
+  }
+  // Keep up to 2000 entries
+  const entries = Object.entries(pruned);
+  analysis.knownListings = Object.fromEntries(entries.slice(-2000));
   analysis.lastSync = new Date().toISOString();
 }
 
@@ -106,7 +159,7 @@ async function syncAll() {
   if (!data.analyses.length) { console.log('No analyses to sync.'); return; }
   for (const a of data.analyses) {
     if (!a.syncEnabled) continue;
-    try { await syncAnalysis(a); } catch (e) { console.error(`Error:`, e.message); }
+    try { await syncAnalysis(a); } catch (e) { console.error(`Error syncing ${a.name}:`, e.message); }
   }
   saveData(data);
 }
@@ -119,82 +172,76 @@ function readBody(req) {
     req.on('end', () => { try { res(JSON.parse(body)); } catch(e) { rej(e); } });
   });
 }
-function ok(res, data)  { res.writeHead(200); res.end(JSON.stringify(data)); }
-function err(res, msg, code = 400) { res.writeHead(code); res.end(JSON.stringify({ error: msg })); }
+function ok(res, data)       { res.writeHead(200); res.end(JSON.stringify(data)); }
+function err(res, msg, c=400){ res.writeHead(c);   res.end(JSON.stringify({ error: msg })); }
 
 // ── HTTP Server ───────────────────────────────────────────────────────────
 const server = http.createServer(async (req, res) => {
   res.setHeader('Access-Control-Allow-Origin', '*');
-  res.setHeader('Access-Control-Allow-Methods', 'GET, POST, PUT, DELETE, OPTIONS');
+  res.setHeader('Access-Control-Allow-Methods', 'GET, POST, DELETE, OPTIONS');
   res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
   res.setHeader('Content-Type', 'application/json');
   if (req.method === 'OPTIONS') { res.writeHead(200); res.end(); return; }
 
-  const u    = new URL(req.url, 'http://localhost');
-  const path = u.pathname;
+  const u = new URL(req.url, 'http://localhost');
 
-  // Health
-  if (req.method === 'GET' && path === '/health') {
+  if (req.method === 'GET' && u.pathname === '/health') {
     const data = loadData();
-    return ok(res, { ok: true, analyses: data.analyses.length, favourites: (data.favourites||[]).length, time: new Date().toISOString() });
+    return ok(res, { ok: true, analyses: data.analyses.length, time: new Date().toISOString() });
   }
 
-  // ── Analyses ──────────────────────────────────────────────────────────
-  if (req.method === 'GET' && path === '/analyses') {
-    return ok(res, loadData().analyses);
+  if (req.method === 'GET' && u.pathname === '/analyses') {
+    return ok(res, loadData().analyses.map(a => ({
+      id: a.id, name: a.name, syncEnabled: a.syncEnabled,
+      minScore: a.minScore, ntfyChannel: a.ntfyChannel,
+      lastSync: a.lastSync, searchUrls: a.searchUrls,
+    })));
   }
 
-  if (req.method === 'POST' && path === '/analyses') {
+  if (req.method === 'POST' && u.pathname === '/analyses') {
     try {
       const payload = await readBody(req);
-      const data    = loadData();
-      const idx     = data.analyses.findIndex(a => a.id === payload.id);
+      const data = loadData();
+      const idx = data.analyses.findIndex(a => a.id === payload.id);
       if (idx >= 0) {
         data.analyses[idx] = { ...data.analyses[idx], ...payload };
       } else {
-        data.analyses.push({ knownOriginIds: [], lastSync: null, ...payload });
+        data.analyses.push({ knownListings: {}, lastSync: null, ...payload });
       }
       saveData(data);
       return ok(res, { ok: true });
     } catch (e) { return err(res, e.message); }
   }
 
-  if (req.method === 'DELETE' && path.startsWith('/analyses/')) {
-    const id   = path.split('/').pop();
+  if (req.method === 'DELETE' && u.pathname.startsWith('/analyses/')) {
+    const id = u.pathname.split('/').pop();
     const data = loadData();
     data.analyses = data.analyses.filter(a => String(a.id) !== id);
     saveData(data);
     return ok(res, { ok: true });
   }
 
-  // ── Favourites ────────────────────────────────────────────────────────
-  if (req.method === 'GET' && path === '/favourites') {
-    return ok(res, loadData().favourites || []);
+  if (req.method === 'GET' && u.pathname === '/notifications') {
+    return ok(res, loadData().notifications || []);
   }
 
-  if (req.method === 'POST' && path === '/favourites') {
-    try {
-      const payload = await readBody(req);
-      const data    = loadData();
-      if (!data.favourites) data.favourites = [];
-      const idx = data.favourites.findIndex(f => f.id === payload.id);
-      if (idx >= 0) data.favourites[idx] = payload;
-      else data.favourites.push(payload);
-      saveData(data);
-      return ok(res, { ok: true });
-    } catch (e) { return err(res, e.message); }
-  }
-
-  if (req.method === 'DELETE' && path.startsWith('/favourites/')) {
-    const id   = path.split('/').pop();
+  if (req.method === 'POST' && u.pathname === '/notifications/read') {
     const data = loadData();
-    data.favourites = (data.favourites || []).filter(f => String(f.id) !== id);
+    (data.notifications || []).forEach(n => n.read = true);
     saveData(data);
     return ok(res, { ok: true });
   }
 
-  // ── Manual sync ───────────────────────────────────────────────────────
-  if (req.method === 'POST' && path === '/sync') {
+  if (req.method === 'POST' && u.pathname.startsWith('/notifications/read/')) {
+    const id = parseInt(u.pathname.split('/').pop());
+    const data = loadData();
+    const n = (data.notifications || []).find(n => n.id === id);
+    if (n) n.read = true;
+    saveData(data);
+    return ok(res, { ok: true });
+  }
+
+  if (req.method === 'POST' && u.pathname === '/sync') {
     ok(res, { ok: true, message: 'Sync started' });
     syncAll().catch(console.error);
     return;
@@ -206,5 +253,5 @@ const server = http.createServer(async (req, res) => {
 const PORT = process.env.PORT || 3000;
 server.listen(PORT, () => console.log(`AutoImport server running on port ${PORT}`));
 cron.schedule('0 9-19 * * *', () => { console.log('⏰ Hourly sync'); syncAll().catch(console.error); });
-console.log('✅ Cron job scheduled: 9h-19h daily');
+console.log('✅ Cron: 9h-19h daily');
 syncAll().catch(console.error);
