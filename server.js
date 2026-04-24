@@ -29,12 +29,19 @@ async function scrapeUrl(actorId, url, maxItems = 100) {
 }
 
 // ── ntfy + history ────────────────────────────────────────────────────────
+// Codifica headers HTTP com UTF-8 (RFC 2047) para suportar emojis
+function encodeNtfyHeader(val) {
+  if (!val) return val;
+  if (/^[\x00-\x7F]*$/.test(val)) return val;
+  return `=?UTF-8?B?${Buffer.from(val, 'utf-8').toString('base64')}?=`;
+}
+
 async function notify(channel, title, message, priority = 'default', analysisId = null) {
   if (!channel) return;
   try {
     await fetch(`https://ntfy.sh/${channel}`, {
       method: 'POST',
-      headers: { 'Title': title, 'Priority': priority, 'Tags': 'car,autoimport' },
+      headers: { 'Title': encodeNtfyHeader(title), 'Priority': priority, 'Tags': 'car,autoimport' },
       body: message,
     });
   } catch (e) { console.error('ntfy error:', e.message); }
@@ -248,14 +255,16 @@ const server = http.createServer(async (req, res) => {
       const { channel, title, message, priority = 'default', tags = '' } = body;
       if (!channel) return err(res, 'channel required');
       if (!message) return err(res, 'message required');
+
       const headers = {};
-      if (title) headers['Title'] = title;
+      if (title) headers['Title'] = encodeNtfyHeader(title);
       if (priority) headers['Priority'] = priority;
-      if (tags) headers['Tags'] = tags;
+      if (tags) headers['Tags'] = tags;  // tags são sempre ASCII no ntfy
+
       const resp = await fetch(`https://ntfy.sh/${encodeURIComponent(channel)}`, {
         method: 'POST',
         headers,
-        body: message
+        body: message  // o body pode ter UTF-8 sem problema
       });
       if (!resp.ok) {
         const text = await resp.text().catch(() => '');
@@ -309,7 +318,7 @@ const server = http.createServer(async (req, res) => {
           await fetch(`https://ntfy.sh/${body.ntfyChannel}`, {
             method: 'POST',
             headers: {
-              'Title': '📦 Backup actualizado',
+              'Title': encodeNtfyHeader('📦 Backup actualizado'),
               'Priority': 'default',
               'Tags': 'package,arrow_down',
               'Click': body.clickUrl || ''
