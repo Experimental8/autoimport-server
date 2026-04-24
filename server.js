@@ -241,6 +241,32 @@ const server = http.createServer(async (req, res) => {
     return ok(res, { url: listingUrl, history: [] });
   }
 
+  // POST /notify { channel, title, message, priority?, tags? } — proxy ntfy via servidor (evita CORS no browser)
+  if (req.method === 'POST' && u.pathname === '/notify') {
+    try {
+      const body = await readBody(req);
+      const { channel, title, message, priority = 'default', tags = '' } = body;
+      if (!channel) return err(res, 'channel required');
+      if (!message) return err(res, 'message required');
+      const headers = {};
+      if (title) headers['Title'] = title;
+      if (priority) headers['Priority'] = priority;
+      if (tags) headers['Tags'] = tags;
+      const resp = await fetch(`https://ntfy.sh/${encodeURIComponent(channel)}`, {
+        method: 'POST',
+        headers,
+        body: message
+      });
+      if (!resp.ok) {
+        const text = await resp.text().catch(() => '');
+        return err(res, `ntfy ${resp.status}: ${text.substring(0,200)}`, resp.status);
+      }
+      return ok(res, { sent: true });
+    } catch (e) {
+      return err(res, e.message);
+    }
+  }
+
   // POST /brave-search { query, key, count }
   if (req.method === 'POST' && u.pathname === '/brave-search') {
     try {
