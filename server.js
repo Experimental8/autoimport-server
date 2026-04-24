@@ -20,9 +20,7 @@ function saveData(data) { fs.writeFileSync(DATA_FILE, JSON.stringify(data, null,
 async function scrapeUrl(actorId, url, maxItems = 100) {
   const endpoint = `https://api.apify.com/v2/acts/${encodeURIComponent(actorId)}/run-sync-get-dataset-items`;
   const params = new URLSearchParams({ token: APIFY_TOKEN, maxItems, format: 'json' });
-  const input = actorId.includes('mobile-de')
-    ? { urls: [url], maxRecords: maxItems }
-    : { urls: [{ url }], maxRecords: maxItems };
+  const input = { urls: [{ url }], maxRecords: maxItems };
   const resp = await fetch(`${endpoint}?${params}`, {
     method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(input),
   });
