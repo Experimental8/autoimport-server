@@ -221,6 +221,28 @@ const server = http.createServer(async (req, res) => {
     return ok(res, { ok: true });
   }
 
+  // GET /listing-history?url=...
+  if (req.method === 'GET' && u.pathname === '/listing-history') {
+    const listingUrl = u.searchParams.get('url');
+    if (!listingUrl) return err(res, 'url query param required');
+    const data = loadData();
+    for (const a of data.analyses || []) {
+      const kl = a.knownListings || {};
+      if (kl[listingUrl]) {
+        return ok(res, {
+          url: listingUrl,
+          analysisId: a.id,
+          analysisName: a.name,
+          firstSeen: kl[listingUrl].firstSeen,
+          currentPrice: kl[listingUrl].price,
+          currentScore: kl[listingUrl].score,
+          history: kl[listingUrl].priceHistory || [],
+        });
+      }
+    }
+    return ok(res, { url: listingUrl, history: [] });
+  }
+
   if (req.method === 'GET' && u.pathname === '/notifications') {
     return ok(res, loadData().notifications || []);
   }
