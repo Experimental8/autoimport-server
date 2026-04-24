@@ -32,7 +32,7 @@ async function scrapeUrl(actorId, url, maxItems = 100) {
 }
 
 // ── ntfy ──────────────────────────────────────────────────────────────────
-async function notify(channel, title, message, priority = 'default') {
+async function notify(channel, title, message, priority = 'default', analysisId = null) {
   if (!channel) return;
   try {
     await fetch(`https://ntfy.sh/${channel}`, {
@@ -41,6 +41,23 @@ async function notify(channel, title, message, priority = 'default') {
       body: message,
     });
   } catch (e) { console.error('ntfy error:', e.message); }
+
+  // Save to history
+  const data = loadData();
+  if (!data.notifications) data.notifications = [];
+  data.notifications.push({
+    id: Date.now(),
+    analysisId,
+    title,
+    message,
+    priority,
+    ts: new Date().toISOString(),
+    read: false,
+  });
+  // Keep 7 days only
+  const cutoff = Date.now() - 7 * 24 * 60 * 60 * 1000;
+  data.notifications = data.notifications.filter(n => new Date(n.ts).getTime() > cutoff);
+  saveData(data);
 }
 
 // ── Sync ──────────────────────────────────────────────────────────────────
@@ -74,7 +91,7 @@ async function syncAnalysis(analysis) {
       const price = r['price/amount'] || r.rawPrice || r.price || '';
       const km    = r['properties/milage'] || r.milage || '';
       await notify(ntfyChannel, `🚗 Novo anúncio: ${name}`,
-        `${make} ${model} — ${price ? price+'€' : 'preço n/d'} — ${km}\n${r.url||''}`, 'high');
+        `${make} ${model} — ${price ? price+'€' : 'preço n/d'} — ${km}\n${r.url||''}`, 'high', analysis.id);
     }
     freshOrigin.forEach(r => { const id = getId(r); if (id) knownIds.add(id); });
     analysis.knownOriginIds = [...knownIds].slice(-2000);
