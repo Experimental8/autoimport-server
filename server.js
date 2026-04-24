@@ -262,7 +262,66 @@ const server = http.createServer(async (req, res) => {
     }
   }
 
-  if (req.method === 'GET' && u.pathname === '/notifications') {
+  // POST /backup — upload current state (plataforma → servidor)
+  if (req.method === 'POST' && u.pathname === '/backup') {
+    try {
+      const body = await readBody(req);
+      const data = loadData();
+      const now = Date.now();
+      data.backup = {
+        payload: body.payload,       // full JSON from exportarDados()
+        uploadedAt: now,
+        uploadedBy: body.uploader || 'unknown',
+        version: (data.backup?.version || 0) + 1,
+        sizeBytes: JSON.stringify(body.payload).length
+      };
+      saveData(data);
+
+      // Notify via ntfy if channel provided
+      if (body.ntfyChannel) {
+        try {
+          await fetch(`https://ntfy.sh/${body.ntfyChannel}`, {
+            method: 'POST',
+            headers: {
+              'Title': '📦 Backup actualizado',
+              'Priority': 'default',
+              'Tags': 'package,arrow_down',
+              'Click': body.clickUrl || ''
+            },
+            body: `${body.uploader || 'Alguém'} actualizou os dados. Abre a app e sincroniza.`
+          });
+        } catch (e) { console.warn('ntfy notify failed:', e.message); }
+      }
+
+      return ok(res, { version: data.backup.version, uploadedAt: now });
+    } catch (e) { return err(res, e.message); }
+  }
+
+  // GET /backup/meta — check if new version available (lightweight, <100 bytes)
+  if (req.method === 'GET' && u.pathname === '/backup/meta') {
+    try {
+      const data = loadData();
+      if (!data.backup) return ok(res, { exists: false });
+      return ok(res, {
+        exists: true,
+        version: data.backup.version,
+        uploadedAt: data.backup.uploadedAt,
+        uploadedBy: data.backup.uploadedBy,
+        sizeBytes: data.backup.sizeBytes
+      });
+    } catch (e) { return err(res, e.message); }
+  }
+
+  // GET /backup — download the current backup (returns full payload)
+  if (req.method === 'GET' && u.pathname === '/backup') {
+    try {
+      const data = loadData();
+      if (!data.backup) return err(res, 'No backup available', 404);
+      return ok(res, data.backup);
+    } catch (e) { return err(res, e.message); }
+  }
+
+    if (req.method === 'GET' && u.pathname === '/notifications') {
     return ok(res, loadData().notifications || []);
   }
 
