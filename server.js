@@ -243,6 +243,27 @@ const server = http.createServer(async (req, res) => {
     return ok(res, { url: listingUrl, history: [] });
   }
 
+  // POST /brave-search { query, key, count }
+  if (req.method === 'POST' && u.pathname === '/brave-search') {
+    try {
+      const body = await readBody(req);
+      const { query, key, count = 3 } = body;
+      if (!query) return err(res, 'query required');
+      if (!key) return err(res, 'key required');
+      const braveUrl = 'https://api.search.brave.com/res/v1/web/search?q=' + encodeURIComponent(query) + '&count=' + count;
+      const resp = await fetch(braveUrl, {
+        headers: { 'Accept': 'application/json', 'X-Subscription-Token': key }
+      });
+      if (!resp.ok) {
+        return err(res, 'Brave API ' + resp.status, resp.status);
+      }
+      const data = await resp.json();
+      return ok(res, data);
+    } catch (e) {
+      return err(res, e.message);
+    }
+  }
+
   if (req.method === 'GET' && u.pathname === '/notifications') {
     return ok(res, loadData().notifications || []);
   }
