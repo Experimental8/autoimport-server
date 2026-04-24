@@ -274,6 +274,13 @@ const server = http.createServer(async (req, res) => {
 
 const PORT = process.env.PORT || 3000;
 server.listen(PORT, () => console.log(`AutoImport server running on port ${PORT}`));
-cron.schedule('0 9-19 * * *', () => { console.log('⏰ Hourly sync'); syncAll().catch(console.error); });
-console.log('✅ Cron: 9h-19h daily');
+// Sync às 08h, 12h, 14h30 e 17h30 — todos os dias incluindo fim-de-semana
+const syncTimes = ['0 8 * * *', '0 12 * * *', '30 14 * * *', '30 17 * * *'];
+syncTimes.forEach(expr => {
+  cron.schedule(expr, () => {
+    console.log(`⏰ Sync scheduled: ${expr}`);
+    syncAll().catch(console.error);
+  });
+});
+console.log('✅ Cron: 08h, 12h, 14h30, 17h30 — todos os dias');
 syncAll().catch(console.error);
