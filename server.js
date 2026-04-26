@@ -36,13 +36,15 @@ function encodeNtfyHeader(val) {
   return `=?UTF-8?B?${Buffer.from(val, 'utf-8').toString('base64')}?=`;
 }
 
-async function notify(channel, title, message, priority = 'default', analysisId = null) {
+async function notify(channel, title, message, priority = 'default', analysisId = null, subtitle = null) {
   if (!channel) return;
   try {
+    // ntfy não tem subtítulo nativo — prepend ao message como linha em destaque
+    const fullMessage = subtitle ? `${subtitle}\n${'─'.repeat(20)}\n${message}` : message;
     await fetch(`https://ntfy.sh/${channel}`, {
       method: 'POST',
       headers: { 'Title': encodeNtfyHeader(title), 'Priority': priority, 'Tags': 'car,autoimport' },
-      body: message,
+      body: fullMessage,
     });
   } catch (e) { console.error('ntfy error:', e.message); }
 
@@ -76,12 +78,71 @@ function getMake(r)  { return r.manufacturer || r.make || ''; }
 function getModel(r) { return r.model || ''; }
 function getKm(r)    { return r['properties/milage'] || r.milage || ''; }
 function fmt(n)      { return n != null ? n.toLocaleString('pt-PT') : '—'; }
+function fmtEur(n)   { return n != null ? '€' + n.toLocaleString('pt-PT') : '€—'; }
+
+// ── Quick Score Calculation (replicates platform calcMarg in simplified form) ──
+const TRANSPORT_BY_COUNTRY = {
+  'D': 700, 'DE': 700, 'Alemanha': 700, 'Germany': 700,
+  'F': 600, 'FR': 600, 'França': 600, 'France': 600,
+  'B': 500, 'BE': 500, 'Bélgica': 500, 'Belgium': 500,
+  'NL': 600, 'Holanda': 600, 'Netherlands': 600,
+  'IT': 800, 'Itália': 800, 'Italy': 800,
+  'ES': 400, 'Espanha': 400, 'Spain': 400,
+  'AT': 750, 'Austria': 750, 'Áustria': 750,
+};
+
+const ISV_BY_FUEL_SIMPLIFIED = {
+  'Elétrico': 0, 'Eletrico': 0, 'Electric': 0,
+  'PHEV': 1500, 'Plug-in': 1500, 'plug-in-hybrid': 1500, 'HYBRID_PLUGIN': 1500,
+  'Híbrido': 3500, 'Hibrido': 3500, 'Hybrid': 3500,
+  'Gasolina': 5500, 'Petrol': 5500, 'PETROL': 5500,
+  'Gasóleo': 6500, 'Gasoleo': 6500, 'Diesel': 6500, 'DIESEL': 6500,
+};
+
+const LEGAL_FIXED = 1000; // legalização média
+
+function getCountry(r) {
+  return r['vehicle/country'] || r['dealer/contry'] || r['dealer/address/contry'] || r.country || r['vehicleLocation/country'] || 'D';
+}
+
+function getFuel(r) {
+  return r['vehicle/fuel'] || r.fuel || r['fuelType'] || r['properties/fuelType'] || '';
+}
+
+function calcQuickScore(car, cachedRef) {
+  if (!cachedRef?.priceMedian) return null;
+  const price = getPrice(car);
+  if (!price) return null;
+
+  const country = getCountry(car);
+  const transp = TRANSPORT_BY_COUNTRY[country] || 700;
+
+  const fuel = getFuel(car);
+  let isv = 5500;
+  for (const [k, v] of Object.entries(ISV_BY_FUEL_SIMPLIFIED)) {
+    if (fuel.toString().toLowerCase().includes(k.toLowerCase())) {
+      isv = v;
+      break;
+    }
+  }
+
+  const custo = price + transp + isv + LEGAL_FIXED;
+  const svRef = cachedRef.priceMedian;
+  const mb = svRef - custo;
+  const ivaM = Math.round(0.23 * (svRef - price));
+  const ml = mb - ivaM;
+  const mp = custo > 0 ? mb / custo : 0;
+  const score = Math.min(100, Math.max(0, Math.round(mp * 200)));
+
+  return { score, custo, mb, ml, svRef, transp, isv };
+}
 
 // ── Sync ──────────────────────────────────────────────────────────────────
 async function syncAnalysis(analysis) {
-  const { name, searchUrls, ntfyChannel, minScore = 0 } = analysis;
+  // Filtros suportados: minScore (principal) + maxPrice (segurança extra)
+  const { name, searchUrls, ntfyChannel, minScore = 30, maxPrice = 0, cachedRef } = analysis;
   if (!searchUrls?.length) return;
-  console.log(`[${new Date().toISOString()}] Syncing: ${name}`);
+  console.log(`[${new Date().toISOString()}] Syncing: ${name} (maxPrice=${maxPrice || 'none'})`);
 
   const freshOrigin = [];
   for (const { url, source } of searchUrls.filter(s => s.source !== 'sv')) {
@@ -93,67 +154,191 @@ async function syncAnalysis(analysis) {
     } catch (e) { console.error(`  ${source} error:`, e.message); }
   }
 
-  // knownListings: { [id]: { price, score } }
+  // Modo aprendizagem: primeira sync nunca notifica, só regista
+  const isFirstSync = !analysis.lastSync;
   const knownListings = analysis.knownListings || {};
-  const newListings   = [];
-  const priceDrops    = [];
+  const newListings = [];
+  const priceDrops = [];
+
+  // Avalia cada anúncio: calcula score + verifica filtros
+  const evaluate = (r) => {
+    const price = getPrice(r);
+    if (!price) return { passes: false, score: null, calc: null };
+
+    // Hard limit: maxPrice (se definido)
+    if (maxPrice > 0 && price > maxPrice) {
+      return { passes: false, reason: 'over-maxPrice', score: null, calc: null };
+    }
+
+    // Score (precisa cachedRef)
+    const calc = cachedRef ? calcQuickScore(r, cachedRef) : null;
+    const score = calc?.score ?? null;
+
+    // Sem cachedRef: notifica tudo (não consegue decidir)
+    // Com cachedRef: só notifica se score >= minScore
+    const passes = score == null ? true : score >= minScore;
+
+    return { passes, score, calc };
+  };
 
   for (const r of freshOrigin) {
-    const id    = getId(r);
+    const id = getId(r);
     if (!id) continue;
     const price = getPrice(r);
-    const score = r.score || r.pontuation || null;
+    const evalResult = evaluate(r);
 
     if (!knownListings[id]) {
-      // Brand new listing — only notify if score >= minScore
-      if (minScore <= 0 || score == null || score >= minScore) {
-        newListings.push(r);
+      // Anúncio novo
+      if (evalResult.passes) {
+        newListings.push({ r, score: evalResult.score, calc: evalResult.calc });
       }
-      knownListings[id] = { price, score, firstSeen: new Date().toISOString() };
+      knownListings[id] = {
+        price,
+        score: evalResult.score,
+        firstSeen: new Date().toISOString()
+      };
     } else {
-      // Known listing — notify only if:
-      // was below minScore, price dropped, and now score >= minScore
+      // Anúncio conhecido
       const prev = knownListings[id];
-      const wasBelow = prev.score == null || (minScore > 0 && prev.score < minScore);
-      const priceDrop = price != null && prev.price != null && price < prev.price;
-      const nowAbove  = score != null && (minScore <= 0 || score >= minScore);
+      const priceDropped = price != null && prev.price != null && price < prev.price;
+      const wasBelow = prev.score == null || prev.score < minScore;
+      const nowPasses = evalResult.passes;
 
-      if (wasBelow && priceDrop && nowAbove) {
-        priceDrops.push({ r, prev, price, score });
+      // Notifica descida se: caiu de preço E agora passa no filtro
+      if (priceDropped && nowPasses) {
+        priceDrops.push({
+          r, prev, price,
+          score: evalResult.score,
+          calc: evalResult.calc,
+          crossedThreshold: wasBelow
+        });
       }
-      knownListings[id] = { price, score, firstSeen: prev.firstSeen };
+      knownListings[id] = {
+        price,
+        score: evalResult.score,
+        firstSeen: prev.firstSeen
+      };
     }
   }
 
-  // 🚗 Novo anúncio com score acima do mínimo
-  if (newListings.length > 0) {
-    console.log(`  → ${newListings.length} new listings above min score`);
-    for (const r of newListings.slice(0, 5)) {
-      const price = getPrice(r);
-      const score = r.score || r.pontuation || '';
-      const msg = `${getMake(r)} ${getModel(r)} — ${price ? fmt(price)+'€' : 'preço n/d'} — ${getKm(r)}${score ? ' · Score '+score : ''}\n${getId(r)}`;
-      await notify(ntfyChannel, `🚗 Novo anúncio: ${name}`, msg, 'high', analysis.id);
+  // ── PRIMEIRA SYNC: aprende silenciosamente ──
+  if (isFirstSync) {
+    console.log(`  → Primeira sync (aprendizagem): ${freshOrigin.length} anúncios registados`);
+    if (ntfyChannel) {
+      const refTxt = cachedRef?.priceMedian
+        ? `Ref. PT: ${fmtEur(cachedRef.priceMedian)} (${cachedRef.countMatched || 'n/d'} carros)`
+        : '⚠ Sem referência PT — score não vai estar disponível';
+      const msg = `${freshOrigin.length} anúncios registados como ponto de partida.\n\nFiltros activos:\n• Score mín: ${minScore}\n${maxPrice ? `• Preço máx: ${fmtEur(maxPrice)}\n` : ''}• ${refTxt}\n\nPróxima sync: 12h00`;
+      await notify(ntfyChannel, `🌱 ${name} (sync iniciada)`, msg, 'default', analysis.id);
     }
   } else {
-    console.log(`  → No new listings above min score`);
-  }
+    // ── 🚗 Novos anúncios ──
+    const MAX_NEW = 5;
+    if (newListings.length > 0) {
+      console.log(`  → ${newListings.length} novos anúncios passam filtros`);
 
-  // 📉 Baixou de preço e passou o score mínimo
-  if (priceDrops.length > 0) {
-    console.log(`  → ${priceDrops.length} price drops now above min score`);
-    for (const { r, prev, price, score } of priceDrops.slice(0, 3)) {
-      const msg = `${getMake(r)} ${getModel(r)}\n💶 ${fmt(prev.price)}€ → ${fmt(price)}€ (−${fmt(prev.price - price)}€)${score ? ' · Score '+score : ''}\n${getId(r)}`;
-      await notify(ntfyChannel, `📉 Baixou de preço: ${name}`, msg, 'high', analysis.id);
+      if (newListings.length > MAX_NEW) {
+        // RESUMO: muitos novos. Ordena por score desc (melhores primeiro).
+        const sorted = [...newListings].sort((a, b) => (b.score || 0) - (a.score || 0));
+        const top3 = sorted.slice(0, 3);
+        const avgScore = Math.round(sorted.reduce((s, x) => s + (x.score || 0), 0) / sorted.length);
+
+        const top3Lines = top3.map((x, i) => {
+          const price = getPrice(x.r);
+          const km = getKm(x.r);
+          return `${i+1}. Score ${x.score ?? '—'} · ${fmtEur(price)} · ${km || 'n/d'}`;
+        }).join('\n');
+
+        const msg = `Top 3 (score médio ${avgScore}):\n${top3Lines}\n\n+ ${sorted.length - 3} outros (score ≥ ${minScore})\n👉 Tap para ver todos`;
+        await notify(ntfyChannel, `🚗 ${name} (${sorted.length} novos)`, msg, 'high', analysis.id);
+      } else {
+        // POUCOS NOVOS: notificação detalhada por cada
+        // Ordena por score desc (melhor primeiro)
+        const sorted = [...newListings].sort((a, b) => (b.score || 0) - (a.score || 0));
+        for (const { r, score, calc } of sorted) {
+          const price = getPrice(r);
+          const make = getMake(r);
+          const model = getModel(r);
+          const km = getKm(r);
+
+          // Título: modelo (e ano se disponível)
+          const year = r['firstRegistration'] || r.year || r['vehicle/firstRegistration'] || '';
+          const yearStr = year ? ` ${year}`.slice(0, 5) : '';
+          const title = `🚗 ${make} ${model}${yearStr}`.trim();
+
+          // Linha 1 (subtítulo): score + preço + margem
+          let subtitle;
+          if (score != null && calc) {
+            const marginSign = calc.ml >= 0 ? '+' : '−';
+            subtitle = `Score ${score} · ${fmtEur(price)} · ${marginSign}${fmtEur(Math.abs(calc.ml))} margem`;
+          } else {
+            subtitle = `${fmtEur(price)} · ${km || 'km n/d'}`;
+          }
+
+          // Corpo: detalhes
+          let body;
+          if (calc) {
+            body = `${km || 'km n/d'}${yearStr ? ' · ' + year : ''}\nCusto total: ${fmtEur(calc.custo)}\nRef. PT: ${fmtEur(calc.svRef)}\n👉 Tap para abrir`;
+          } else {
+            body = `${km || 'km n/d'}\n${getId(r)}`;
+          }
+
+          await notify(ntfyChannel, title, body, 'high', analysis.id, subtitle);
+        }
+      }
+    } else {
+      console.log(`  → Sem novos anúncios acima de score ${minScore}`);
+    }
+
+    // ── 📉 Descidas de preço ──
+    const MAX_DROPS = 3;
+    if (priceDrops.length > 0) {
+      console.log(`  → ${priceDrops.length} descidas de preço`);
+      // Ordena pelas maiores descidas
+      const sortedDrops = [...priceDrops].sort((a, b) => (b.prev.price - b.price) - (a.prev.price - a.price));
+
+      for (const { r, prev, price, score, calc, crossedThreshold } of sortedDrops.slice(0, MAX_DROPS)) {
+        const drop = prev.price - price;
+        const dropPct = Math.round((drop / prev.price) * 100);
+
+        const make = getMake(r);
+        const model = getModel(r);
+        const year = r['firstRegistration'] || r.year || r['vehicle/firstRegistration'] || '';
+        const yearStr = year ? ` ${year}`.slice(0, 5) : '';
+
+        const title = `📉 ${make} ${model}${yearStr}`.trim();
+
+        // Subtítulo: descida + score actual + margem
+        let subtitle;
+        if (score != null && calc) {
+          const marginSign = calc.ml >= 0 ? '+' : '−';
+          subtitle = `−${fmtEur(drop)} · Score ${score} · margem ${marginSign}${fmtEur(Math.abs(calc.ml))}`;
+        } else {
+          subtitle = `−${fmtEur(drop)} (−${dropPct}%)`;
+        }
+
+        // Body: histórico de preço + detalhes
+        const cross = crossedThreshold ? '\n✓ Agora dentro do filtro' : '';
+        let body = `${fmtEur(prev.price)} → ${fmtEur(price)} (−${dropPct}%)${cross}\n${getKm(r) || 'km n/d'}`;
+        if (calc) {
+          body += `\nCusto: ${fmtEur(calc.custo)} · Ref. PT: ${fmtEur(calc.svRef)}`;
+        }
+        body += `\n👉 Tap para abrir`;
+
+        await notify(ntfyChannel, title, body, 'high', analysis.id, subtitle);
+      }
+      if (sortedDrops.length > MAX_DROPS) {
+        await notify(ntfyChannel, `📉 ${name}`, `+ ${sortedDrops.length - MAX_DROPS} outras descidas de preço.\n👉 Tap para ver todas.`, 'low', analysis.id);
+      }
     }
   }
 
-  // Prune knownListings to IDs still present (max 2000)
+  // Prune knownListings (mantém só os IDs ainda visíveis, max 2000)
   const freshIds = new Set(freshOrigin.map(getId).filter(Boolean));
   const pruned = {};
   for (const [id, val] of Object.entries(knownListings)) {
     if (freshIds.has(id)) pruned[id] = val;
   }
-  // Keep up to 2000 entries
   const entries = Object.entries(pruned);
   analysis.knownListings = Object.fromEntries(entries.slice(-2000));
   analysis.lastSync = new Date().toISOString();
