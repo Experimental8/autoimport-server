@@ -52,7 +52,7 @@ function encodeNtfyHeader(val) {
   return `=?UTF-8?B?${Buffer.from(val, 'utf-8').toString('base64')}?=`;
 }
 
-async function notify(channel, title, message, priority = 'default', analysisId = null, subtitle = null) {
+async function notify(channel, title, message, priority = 'default', analysisId = null, subtitle = null, listingUrl = null) {
   if (!channel) return;
   try {
     // ntfy não tem subtítulo nativo — prepend ao message como linha em destaque
@@ -70,6 +70,7 @@ async function notify(channel, title, message, priority = 'default', analysisId 
   data.notifications.push({
     id: Date.now(),
     analysisId,
+    listingUrl,
     title,
     message,
     priority,
@@ -377,7 +378,7 @@ async function syncAnalysis(analysis) {
             body = `${km || 'km n/d'}\n${getId(r)}`;
           }
 
-          await notify(ntfyChannel, title, body, 'high', analysis.id, subtitle);
+          await notify(ntfyChannel, title, body, 'high', analysis.id, subtitle, getId(r));
         }
       }
     } else {
@@ -419,7 +420,7 @@ async function syncAnalysis(analysis) {
         }
         body += `\n👉 Tap para abrir`;
 
-        await notify(ntfyChannel, title, body, 'high', analysis.id, subtitle);
+        await notify(ntfyChannel, title, body, 'high', analysis.id, subtitle, getId(r));
       }
       if (sortedDrops.length > MAX_DROPS) {
         await notify(ntfyChannel, `📉 ${name}`, `+ ${sortedDrops.length - MAX_DROPS} outras descidas de preço.\n👉 Tap para ver todas.`, 'low', analysis.id);
@@ -634,12 +635,14 @@ const server = http.createServer(async (req, res) => {
     }
   }
 
-  // POST /notify/test { channel } — envia uma notificação fake do tipo "carro novo"
-  // para confirmar que o pipeline ntfy + lista de notificações funciona end-to-end
+  // POST /notify/test { channel, analysisId?, listingUrl? }
+  // Envia uma notificação fake do tipo "carro novo".
+  // Se passares analysisId+listingUrl, ao clicar na notificação na plataforma
+  // navega para a análise + abre modal do carro (testa o fluxo completo).
   if (req.method === 'POST' && u.pathname === '/notify/test') {
     try {
       const body = await readBody(req);
-      const { channel } = body;
+      const { channel, analysisId, listingUrl } = body;
       if (!channel) return err(res, 'channel required');
 
       // Simular uma notificação igual à que o cron geraria
@@ -647,7 +650,7 @@ const server = http.createServer(async (req, res) => {
       const subtitle = 'Score 47 · €82.500 · +€8.400 margem';
       const message = '18.000 km · 2024\nCusto total: €89.500\nRef. PT: €97.900\n👉 Esta é uma notificação de teste';
 
-      await notify(channel, title, message, 'high', 'test', subtitle);
+      await notify(channel, title, message, 'high', analysisId || 'test', subtitle, listingUrl || null);
       return ok(res, { sent: true });
     } catch (e) {
       return err(res, e.message);
