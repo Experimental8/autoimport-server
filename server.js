@@ -7,6 +7,10 @@ const DATA_FILE  = './data.json';
 const APIFY_TOKEN = process.env.APIFY_TOKEN;
 const APIFY_AS24 = 'ivanvs/autoscout-scraper';
 const APIFY_MDE  = 'ivanvs/mobile-de-scraper';
+const APIFY_SV   = 'dadhalfdev/standvirtual-scraper';
+
+// Sync SV: refrescar referência PT a cada 2 dias (em ms)
+const SV_SYNC_INTERVAL_MS = 2 * 24 * 60 * 60 * 1000;
 
 // ── Persistence ───────────────────────────────────────────────────────────
 function loadData() {
@@ -25,6 +29,18 @@ async function scrapeUrl(actorId, url, maxItems = 100) {
     method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(input),
   });
   if (!resp.ok) throw new Error(`Apify ${resp.status}`);
+  return resp.json();
+}
+
+// StandVirtual usa formato diferente: input_url string (não objecto)
+async function scrapeUrlSV(url, maxItems = 100) {
+  const endpoint = `https://api.apify.com/v2/acts/${encodeURIComponent(APIFY_SV)}/run-sync-get-dataset-items`;
+  const params = new URLSearchParams({ token: APIFY_TOKEN, maxItems, format: 'json' });
+  const input = { input_url: url, maxItems };
+  const resp = await fetch(`${endpoint}?${params}`, {
+    method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(input),
+  });
+  if (!resp.ok) throw new Error(`Apify SV ${resp.status}`);
   return resp.json();
 }
 
@@ -138,6 +154,63 @@ function calcQuickScore(car, cachedRef) {
 }
 
 // ── Sync ──────────────────────────────────────────────────────────────────
+
+// Refresca cachedRef (referência PT) de uma análise via StandVirtual.
+// Devolve true se foi feito, false se foi saltado (intervalo não atingido / sem URL SV).
+async function syncSV(analysis) {
+  const svUrls = (analysis.searchUrls || []).filter(s => s.source === 'sv');
+  if (!svUrls.length) return false;
+
+  // Verifica se passou o intervalo desde o último sync SV
+  const lastSV = analysis.lastSyncSV ? new Date(analysis.lastSyncSV).getTime() : 0;
+  const now = Date.now();
+  if (now - lastSV < SV_SYNC_INTERVAL_MS) return false;
+
+  console.log(`  [SV] Refresh referência PT: ${analysis.name}`);
+  const allRows = [];
+  for (const { url } of svUrls) {
+    try {
+      const rows = await scrapeUrlSV(url);
+      allRows.push(...rows);
+    } catch (e) {
+      console.error(`  [SV] error:`, e.message);
+    }
+  }
+
+  if (!allRows.length) {
+    console.log(`  [SV] Sem resultados — mantém cachedRef anterior`);
+    analysis.lastSyncSV = new Date().toISOString();
+    return false;
+  }
+
+  // Calcular preço mediano e percentis 25/75
+  const prices = allRows
+    .map(r => parseFloat(String(r.price || r.preco || '').replace(/[^0-9.]/g, '')))
+    .filter(p => !isNaN(p) && p > 0)
+    .sort((a, b) => a - b);
+
+  if (!prices.length) {
+    analysis.lastSyncSV = new Date().toISOString();
+    return false;
+  }
+
+  const median = prices[Math.floor(prices.length / 2)];
+  const p25 = prices[Math.floor(prices.length * 0.25)];
+  const p75 = prices[Math.floor(prices.length * 0.75)];
+
+  analysis.cachedRef = {
+    priceMedian: Math.round(median),
+    priceP25: Math.round(p25),
+    priceP75: Math.round(p75),
+    countMatched: prices.length,
+    timestamp: now,
+  };
+  analysis.lastSyncSV = new Date().toISOString();
+
+  console.log(`  [SV] cachedRef actualizado: medianoPT=${Math.round(median)}€ (${prices.length} carros)`);
+  return true;
+}
+
 async function syncAnalysis(analysis) {
   // Filtros suportados: minScore (principal) + maxPrice (segurança extra)
   const { name, searchUrls, ntfyChannel, minScore = 30, maxPrice = 0, cachedRef } = analysis;
@@ -186,21 +259,31 @@ async function syncAnalysis(analysis) {
     if (!id) continue;
     const price = getPrice(r);
     const evalResult = evaluate(r);
+    const nowIso = new Date().toISOString();
 
     if (!knownListings[id]) {
-      // Anúncio novo
+      // Anúncio novo — guarda raw para a plataforma normalizar mais tarde
       if (evalResult.passes) {
         newListings.push({ r, score: evalResult.score, calc: evalResult.calc });
       }
       knownListings[id] = {
+        raw: r,
+        source: r._src || null,
         price,
+        prevPrice: null,
+        priceChangedAt: null,
         score: evalResult.score,
-        firstSeen: new Date().toISOString()
+        firstSeen: nowIso,
+        lastSeen: nowIso,
+        missingCount: 0,
+        archived: false,
+        archivedAt: null,
       };
     } else {
       // Anúncio conhecido
       const prev = knownListings[id];
       const priceDropped = price != null && prev.price != null && price < prev.price;
+      const priceChanged = price != null && prev.price != null && price !== prev.price;
       const wasBelow = prev.score == null || prev.score < minScore;
       const nowPasses = evalResult.passes;
 
@@ -213,10 +296,21 @@ async function syncAnalysis(analysis) {
           crossedThreshold: wasBelow
         });
       }
+
+      // Actualiza estado, preservando histórico de preço se mudou
       knownListings[id] = {
+        ...prev,
+        raw: r,
+        source: r._src || prev.source || null,
         price,
+        prevPrice: priceChanged ? prev.price : prev.prevPrice,
+        priceChangedAt: priceChanged ? nowIso : prev.priceChangedAt,
         score: evalResult.score,
-        firstSeen: prev.firstSeen
+        lastSeen: nowIso,
+        missingCount: 0,
+        // Se estava arquivado e voltou a aparecer, desarquiva
+        archived: false,
+        archivedAt: prev.archived ? null : prev.archivedAt,
       };
     }
   }
@@ -333,14 +427,39 @@ async function syncAnalysis(analysis) {
     }
   }
 
-  // Prune knownListings (mantém só os IDs ainda visíveis, max 2000)
+  // Incrementa missingCount para anúncios que não apareceram nesta sync
+  // (em vez de prune imediato — tolerância de 2 syncs antes de arquivar)
+  const ARCHIVE_THRESHOLD = 2;
   const freshIds = new Set(freshOrigin.map(getId).filter(Boolean));
-  const pruned = {};
+  const nowIso = new Date().toISOString();
   for (const [id, val] of Object.entries(knownListings)) {
-    if (freshIds.has(id)) pruned[id] = val;
+    if (freshIds.has(id)) continue; // já actualizado no loop acima
+    val.missingCount = (val.missingCount || 0) + 1;
+    if (val.missingCount >= ARCHIVE_THRESHOLD && !val.archived) {
+      val.archived = true;
+      val.archivedAt = nowIso;
+    }
   }
-  const entries = Object.entries(pruned);
-  analysis.knownListings = Object.fromEntries(entries.slice(-2000));
+
+  // Limite máximo de entradas por análise: 3000 (mais generoso porque agora guardamos raw)
+  // Mantém todos os archived recentes (últimos 30 dias) + activos
+  const MAX_ENTRIES = 3000;
+  const cutoff = Date.now() - 30 * 24 * 60 * 60 * 1000;
+  const survivors = Object.entries(knownListings).filter(([_, v]) => {
+    if (!v.archived) return true; // activos sempre
+    const archivedTs = v.archivedAt ? new Date(v.archivedAt).getTime() : 0;
+    return archivedTs > cutoff; // archived só se < 30 dias
+  });
+  // Se ainda passa o limite, descarta os mais antigos (por lastSeen)
+  if (survivors.length > MAX_ENTRIES) {
+    survivors.sort((a, b) => {
+      const tA = new Date(a[1].lastSeen || a[1].firstSeen || 0).getTime();
+      const tB = new Date(b[1].lastSeen || b[1].firstSeen || 0).getTime();
+      return tB - tA; // mais recentes primeiro
+    });
+    survivors.length = MAX_ENTRIES;
+  }
+  analysis.knownListings = Object.fromEntries(survivors);
   analysis.lastSync = new Date().toISOString();
 }
 
@@ -349,7 +468,13 @@ async function syncAll() {
   if (!data.analyses.length) { console.log('No analyses to sync.'); return; }
   for (const a of data.analyses) {
     if (!a.syncEnabled) continue;
-    try { await syncAnalysis(a); } catch (e) { console.error(`Error syncing ${a.name}:`, e.message); }
+    try {
+      // Refresca referência PT (1× a cada 2 dias) antes do sync principal
+      await syncSV(a);
+      await syncAnalysis(a);
+    } catch (e) {
+      console.error(`Error syncing ${a.name}:`, e.message);
+    }
   }
   saveData(data);
 }
@@ -411,6 +536,54 @@ const server = http.createServer(async (req, res) => {
     return ok(res, { ok: true });
   }
 
+  // GET /analyses/:id/delta?since=<ISO timestamp>
+  // Devolve novos / com preço alterado / arquivados desde o timestamp dado.
+  // A plataforma usa para se actualizar com o que o cron descobriu.
+  if (req.method === 'GET' && /^\/analyses\/[^/]+\/delta$/.test(u.pathname)) {
+    const id = u.pathname.split('/')[2];
+    const sinceParam = u.searchParams.get('since');
+    const sinceTs = sinceParam ? new Date(sinceParam).getTime() : 0;
+    const data = loadData();
+    const a = (data.analyses || []).find(x => String(x.id) === String(id));
+    if (!a) return err(res, 'analysis not found', 404);
+
+    const kl = a.knownListings || {};
+    const novos = [];
+    const alterados = [];
+    const arquivados = [];
+
+    for (const [listingId, v] of Object.entries(kl)) {
+      const firstSeenTs = v.firstSeen ? new Date(v.firstSeen).getTime() : 0;
+      const priceChangedTs = v.priceChangedAt ? new Date(v.priceChangedAt).getTime() : 0;
+      const archivedTs = v.archivedAt ? new Date(v.archivedAt).getTime() : 0;
+
+      // Novo: firstSeen depois do since
+      if (firstSeenTs > sinceTs && !v.archived) {
+        novos.push({ id: listingId, raw: v.raw, source: v.source, firstSeen: v.firstSeen, score: v.score });
+      }
+      // Alterado: priceChangedAt depois do since (e não é só "novo")
+      else if (priceChangedTs > sinceTs && !v.archived && firstSeenTs <= sinceTs) {
+        alterados.push({
+          id: listingId, raw: v.raw, source: v.source,
+          price: v.price, prevPrice: v.prevPrice,
+          priceChangedAt: v.priceChangedAt, score: v.score,
+        });
+      }
+      // Arquivado: archivedAt depois do since
+      if (v.archived && archivedTs > sinceTs) {
+        arquivados.push({ id: listingId, archivedAt: v.archivedAt });
+      }
+    }
+
+    return ok(res, {
+      analysisId: a.id,
+      lastSync: a.lastSync || null,
+      lastSyncSV: a.lastSyncSV || null,
+      cachedRef: a.cachedRef || null,
+      novos, alterados, arquivados,
+    });
+  }
+
   // GET /listing-history?url=...
   if (req.method === 'GET' && u.pathname === '/listing-history') {
     const listingUrl = u.searchParams.get('url');
@@ -455,6 +628,26 @@ const server = http.createServer(async (req, res) => {
         const text = await resp.text().catch(() => '');
         return err(res, `ntfy ${resp.status}: ${text.substring(0,200)}`, resp.status);
       }
+      return ok(res, { sent: true });
+    } catch (e) {
+      return err(res, e.message);
+    }
+  }
+
+  // POST /notify/test { channel } — envia uma notificação fake do tipo "carro novo"
+  // para confirmar que o pipeline ntfy + lista de notificações funciona end-to-end
+  if (req.method === 'POST' && u.pathname === '/notify/test') {
+    try {
+      const body = await readBody(req);
+      const { channel } = body;
+      if (!channel) return err(res, 'channel required');
+
+      // Simular uma notificação igual à que o cron geraria
+      const title = '🚗 BMW M3 Touring 2024 (TESTE)';
+      const subtitle = 'Score 47 · €82.500 · +€8.400 margem';
+      const message = '18.000 km · 2024\nCusto total: €89.500\nRef. PT: €97.900\n👉 Esta é uma notificação de teste';
+
+      await notify(channel, title, message, 'high', 'test', subtitle);
       return ok(res, { sent: true });
     } catch (e) {
       return err(res, e.message);
