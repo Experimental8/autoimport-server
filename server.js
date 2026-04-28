@@ -11,7 +11,7 @@ const APIFY_SV   = 'dadhalfdev/standvirtual-scraper';
 
 // Versão da aplicação — usar formato YYYY-MM-DD-N (incrementar N se vários pushes no mesmo dia)
 // Esta tem que coincidir com APP_VERSION no autoimport_v5.html
-const APP_VERSION = '2026-04-28-5';
+const APP_VERSION = '2026-04-28-6';
 const APP_BUILT_AT = new Date().toISOString();
 
 // Sync SV: refrescar referência PT a cada 2 dias (em ms)
@@ -226,15 +226,28 @@ async function syncAnalysis(analysis) {
   if (!searchUrls?.length) return;
   console.log(`[${new Date().toISOString()}] Syncing: ${name} (minMargin=${Math.round(minMarginPct*100)}% maxPrice=${maxPrice || 'none'})`);
 
-  const freshOrigin = [];
-  for (const { url, source } of searchUrls.filter(s => s.source !== 'sv')) {
-    try {
+  // Paraleliza chamadas Apify (AS24, MDE) — antes era sequencial, agora todas em simultâneo.
+  // Promise.allSettled garante que falha de uma fonte não cancela as outras.
+  const scrapeTargets = searchUrls.filter(s => s.source !== 'sv');
+  const scrapeResults = await Promise.allSettled(
+    scrapeTargets.map(async ({ url, source }) => {
       const actor = source === 'mde' ? APIFY_MDE : APIFY_AS24;
-      const rows  = await scrapeUrl(actor, url);
+      const rows = await scrapeUrl(actor, url);
+      return { source, rows };
+    })
+  );
+
+  const freshOrigin = [];
+  scrapeResults.forEach((result, i) => {
+    const { source } = scrapeTargets[i];
+    if (result.status === 'fulfilled') {
+      const { rows } = result.value;
       freshOrigin.push(...rows.map(r => ({ ...r, _src: source })));
       console.log(`  ${source.toUpperCase()}: ${rows.length}`);
-    } catch (e) { console.error(`  ${source} error:`, e.message); }
-  }
+    } else {
+      console.error(`  ${source} error:`, result.reason?.message || result.reason);
+    }
+  });
 
   // Modo aprendizagem: primeira sync nunca notifica, só regista
   const isFirstSync = !analysis.lastSync;
