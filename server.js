@@ -11,7 +11,7 @@ const APIFY_SV   = 'dadhalfdev/standvirtual-scraper';
 
 // Versão da aplicação — usar formato YYYY-MM-DD-N (incrementar N se vários pushes no mesmo dia)
 // Esta tem que coincidir com APP_VERSION no autoimport_v5.html
-const APP_VERSION = '2026-04-28-1';
+const APP_VERSION = '2026-04-28-3';
 const APP_BUILT_AT = new Date().toISOString();
 
 // Sync SV: refrescar referência PT a cada 2 dias (em ms)
@@ -155,8 +155,11 @@ function calcQuickScore(car, cachedRef) {
   const ml = mb - ivaM;
   const mp = custo > 0 ? mb / custo : 0;
   const score = Math.min(100, Math.max(0, Math.round(mp * 200)));
+  // Margem líquida em percentagem do custo total — métrica decisiva (substitui score na Fase 2)
+  // mlPct é decimal (0.072 = 7.2%)
+  const mlPct = custo > 0 ? ml / custo : 0;
 
-  return { score, custo, mb, ml, svRef, transp, isv };
+  return { score, custo, mb, ml, svRef, transp, isv, mlPct, mlEur: ml };
 }
 
 // ── Sync ──────────────────────────────────────────────────────────────────
@@ -218,10 +221,10 @@ async function syncSV(analysis) {
 }
 
 async function syncAnalysis(analysis) {
-  // Filtros suportados: minScore (principal) + maxPrice (segurança extra)
-  const { name, searchUrls, ntfyChannel, minScore = 30, maxPrice = 0, cachedRef } = analysis;
+  // Filtros suportados: minMarginPct (principal) + maxPrice (segurança extra)
+  const { name, searchUrls, ntfyChannel, minMarginPct = 0.05, maxPrice = 0, cachedRef } = analysis;
   if (!searchUrls?.length) return;
-  console.log(`[${new Date().toISOString()}] Syncing: ${name} (maxPrice=${maxPrice || 'none'})`);
+  console.log(`[${new Date().toISOString()}] Syncing: ${name} (minMargin=${Math.round(minMarginPct*100)}% maxPrice=${maxPrice || 'none'})`);
 
   const freshOrigin = [];
   for (const { url, source } of searchUrls.filter(s => s.source !== 'sv')) {
@@ -239,25 +242,25 @@ async function syncAnalysis(analysis) {
   const newListings = [];
   const priceDrops = [];
 
-  // Avalia cada anúncio: calcula score + verifica filtros
+  // Avalia cada anúncio: calcula margem + verifica filtros
   const evaluate = (r) => {
     const price = getPrice(r);
-    if (!price) return { passes: false, score: null, calc: null };
+    if (!price) return { passes: false, mlPct: null, calc: null };
 
     // Hard limit: maxPrice (se definido)
     if (maxPrice > 0 && price > maxPrice) {
-      return { passes: false, reason: 'over-maxPrice', score: null, calc: null };
+      return { passes: false, reason: 'over-maxPrice', mlPct: null, calc: null };
     }
 
-    // Score (precisa cachedRef)
+    // Margem (precisa cachedRef)
     const calc = cachedRef ? calcQuickScore(r, cachedRef) : null;
-    const score = calc?.score ?? null;
+    const mlPct = calc?.mlPct ?? null;
 
     // Sem cachedRef: notifica tudo (não consegue decidir)
-    // Com cachedRef: só notifica se score >= minScore
-    const passes = score == null ? true : score >= minScore;
+    // Com cachedRef: só notifica se mlPct >= minMarginPct
+    const passes = mlPct == null ? true : mlPct >= minMarginPct;
 
-    return { passes, score, calc };
+    return { passes, mlPct, calc };
   };
 
   for (const r of freshOrigin) {
@@ -270,7 +273,7 @@ async function syncAnalysis(analysis) {
     if (!knownListings[id]) {
       // Anúncio novo — guarda raw para a plataforma normalizar mais tarde
       if (evalResult.passes) {
-        newListings.push({ r, score: evalResult.score, calc: evalResult.calc });
+        newListings.push({ r, mlPct: evalResult.mlPct, calc: evalResult.calc });
       }
       knownListings[id] = {
         raw: r,
@@ -278,7 +281,7 @@ async function syncAnalysis(analysis) {
         price,
         prevPrice: null,
         priceChangedAt: null,
-        score: evalResult.score,
+        mlPct: evalResult.mlPct,
         firstSeen: nowIso,
         lastSeen: nowIso,
         missingCount: 0,
@@ -290,14 +293,14 @@ async function syncAnalysis(analysis) {
       const prev = knownListings[id];
       const priceDropped = price != null && prev.price != null && price < prev.price;
       const priceChanged = price != null && prev.price != null && price !== prev.price;
-      const wasBelow = prev.score == null || prev.score < minScore;
+      const wasBelow = prev.mlPct == null || prev.mlPct < minMarginPct;
       const nowPasses = evalResult.passes;
 
       // Notifica descida se: caiu de preço E agora passa no filtro
       if (priceDropped && nowPasses) {
         priceDrops.push({
           r, prev, price,
-          score: evalResult.score,
+          mlPct: evalResult.mlPct,
           calc: evalResult.calc,
           crossedThreshold: wasBelow
         });
@@ -311,7 +314,7 @@ async function syncAnalysis(analysis) {
         price,
         prevPrice: priceChanged ? prev.price : prev.prevPrice,
         priceChangedAt: priceChanged ? nowIso : prev.priceChangedAt,
-        score: evalResult.score,
+        mlPct: evalResult.mlPct,
         lastSeen: nowIso,
         missingCount: 0,
         // Se estava arquivado e voltou a aparecer, desarquiva
@@ -327,8 +330,8 @@ async function syncAnalysis(analysis) {
     if (ntfyChannel) {
       const refTxt = cachedRef?.priceMedian
         ? `Ref. PT: ${fmtEur(cachedRef.priceMedian)} (${cachedRef.countMatched || 'n/d'} carros)`
-        : '⚠ Sem referência PT — score não vai estar disponível';
-      const msg = `${freshOrigin.length} anúncios registados como ponto de partida.\n\nFiltros activos:\n• Score mín: ${minScore}\n${maxPrice ? `• Preço máx: ${fmtEur(maxPrice)}\n` : ''}• ${refTxt}\n\nPróxima sync: 12h00`;
+        : '⚠ Sem referência PT — margem não vai estar disponível';
+      const msg = `${freshOrigin.length} anúncios registados como ponto de partida.\n\nFiltros activos:\n• Margem mín: ${Math.round(minMarginPct*100)}%\n${maxPrice ? `• Preço máx: ${fmtEur(maxPrice)}\n` : ''}• ${refTxt}\n\nPróxima sync: 12h00`;
       await notify(ntfyChannel, `🌱 ${name} (sync iniciada)`, msg, 'default', analysis.id);
     }
   } else {
@@ -337,25 +340,29 @@ async function syncAnalysis(analysis) {
     if (newListings.length > 0) {
       console.log(`  → ${newListings.length} novos anúncios passam filtros`);
 
+      const fmtMlp = (m) => m == null ? '—' : Math.round(m * 100) + '%';
+
       if (newListings.length > MAX_NEW) {
-        // RESUMO: muitos novos. Ordena por score desc (melhores primeiro).
-        const sorted = [...newListings].sort((a, b) => (b.score || 0) - (a.score || 0));
+        // RESUMO: muitos novos. Ordena por margem desc (melhores primeiro).
+        const sorted = [...newListings].sort((a, b) => (b.mlPct || 0) - (a.mlPct || 0));
         const top3 = sorted.slice(0, 3);
-        const avgScore = Math.round(sorted.reduce((s, x) => s + (x.score || 0), 0) / sorted.length);
+        const valid = sorted.filter(x => x.mlPct != null);
+        const avgMlp = valid.length ? valid.reduce((s, x) => s + x.mlPct, 0) / valid.length : null;
 
         const top3Lines = top3.map((x, i) => {
           const price = getPrice(x.r);
           const km = getKm(x.r);
-          return `${i+1}. Score ${x.score ?? '—'} · ${fmtEur(price)} · ${km || 'n/d'}`;
+          return `${i+1}. ${fmtMlp(x.mlPct)} · ${fmtEur(price)} · ${km || 'n/d'}`;
         }).join('\n');
 
-        const msg = `Top 3 (score médio ${avgScore}):\n${top3Lines}\n\n+ ${sorted.length - 3} outros (score ≥ ${minScore})\n👉 Tap para ver todos`;
+        const avgTxt = avgMlp != null ? ` (margem média ${fmtMlp(avgMlp)})` : '';
+        const msg = `Top 3${avgTxt}:\n${top3Lines}\n\n+ ${sorted.length - 3} outros (margem ≥ ${Math.round(minMarginPct*100)}%)\n👉 Tap para ver todos`;
         await notify(ntfyChannel, `🚗 ${name} (${sorted.length} novos)`, msg, 'high', analysis.id);
       } else {
         // POUCOS NOVOS: notificação detalhada por cada
-        // Ordena por score desc (melhor primeiro)
-        const sorted = [...newListings].sort((a, b) => (b.score || 0) - (a.score || 0));
-        for (const { r, score, calc } of sorted) {
+        // Ordena por margem desc (melhor primeiro)
+        const sorted = [...newListings].sort((a, b) => (b.mlPct || 0) - (a.mlPct || 0));
+        for (const { r, mlPct, calc } of sorted) {
           const price = getPrice(r);
           const make = getMake(r);
           const model = getModel(r);
@@ -366,11 +373,11 @@ async function syncAnalysis(analysis) {
           const yearStr = year ? ` ${year}`.slice(0, 5) : '';
           const title = `🚗 ${make} ${model}${yearStr}`.trim();
 
-          // Linha 1 (subtítulo): score + preço + margem
+          // Linha 1 (subtítulo): margem + preço + valor margem
           let subtitle;
-          if (score != null && calc) {
+          if (mlPct != null && calc) {
             const marginSign = calc.ml >= 0 ? '+' : '−';
-            subtitle = `Score ${score} · ${fmtEur(price)} · ${marginSign}${fmtEur(Math.abs(calc.ml))} margem`;
+            subtitle = `${fmtMlp(mlPct)} · ${fmtEur(price)} · ${marginSign}${fmtEur(Math.abs(calc.ml))} margem`;
           } else {
             subtitle = `${fmtEur(price)} · ${km || 'km n/d'}`;
           }
@@ -387,7 +394,7 @@ async function syncAnalysis(analysis) {
         }
       }
     } else {
-      console.log(`  → Sem novos anúncios acima de score ${minScore}`);
+      console.log(`  → Sem novos anúncios acima de margem ${Math.round(minMarginPct*100)}%`);
     }
 
     // ── 📉 Descidas de preço ──
@@ -397,7 +404,7 @@ async function syncAnalysis(analysis) {
       // Ordena pelas maiores descidas
       const sortedDrops = [...priceDrops].sort((a, b) => (b.prev.price - b.price) - (a.prev.price - a.price));
 
-      for (const { r, prev, price, score, calc, crossedThreshold } of sortedDrops.slice(0, MAX_DROPS)) {
+      for (const { r, prev, price, mlPct, calc, crossedThreshold } of sortedDrops.slice(0, MAX_DROPS)) {
         const drop = prev.price - price;
         const dropPct = Math.round((drop / prev.price) * 100);
 
@@ -408,11 +415,12 @@ async function syncAnalysis(analysis) {
 
         const title = `📉 ${make} ${model}${yearStr}`.trim();
 
-        // Subtítulo: descida + score actual + margem
+        // Subtítulo: descida + margem actual + margem €
+        const fmtMlp = (m) => m == null ? '—' : Math.round(m * 100) + '%';
         let subtitle;
-        if (score != null && calc) {
+        if (mlPct != null && calc) {
           const marginSign = calc.ml >= 0 ? '+' : '−';
-          subtitle = `−${fmtEur(drop)} · Score ${score} · margem ${marginSign}${fmtEur(Math.abs(calc.ml))}`;
+          subtitle = `−${fmtEur(drop)} · ${fmtMlp(mlPct)} · ${marginSign}${fmtEur(Math.abs(calc.ml))}`;
         } else {
           subtitle = `−${fmtEur(drop)} (−${dropPct}%)`;
         }
@@ -515,10 +523,22 @@ const server = http.createServer(async (req, res) => {
     return ok(res, { version: APP_VERSION, builtAt: APP_BUILT_AT });
   }
 
+  // POST /admin/wipe — apaga TODOS os dados do servidor (analyses + notifications)
+  // Sem autenticação por simplicidade (B2B com 2 utilizadores). Usar só uma vez na migração para Margem%.
+  if (req.method === 'POST' && u.pathname === '/admin/wipe') {
+    try {
+      saveData({ analyses: [], notifications: [] });
+      console.log(`[${new Date().toISOString()}] ⚠️  /admin/wipe: dados apagados`);
+      return ok(res, { ok: true, message: 'Todos os dados apagados (analyses + notifications)' });
+    } catch (e) {
+      return err(res, e.message);
+    }
+  }
+
   if (req.method === 'GET' && u.pathname === '/analyses') {
     return ok(res, loadData().analyses.map(a => ({
       id: a.id, name: a.name, syncEnabled: a.syncEnabled,
-      minScore: a.minScore, ntfyChannel: a.ntfyChannel,
+      minMarginPct: a.minMarginPct, ntfyChannel: a.ntfyChannel,
       lastSync: a.lastSync, searchUrls: a.searchUrls,
     })));
   }
@@ -569,14 +589,14 @@ const server = http.createServer(async (req, res) => {
 
       // Novo: firstSeen depois do since
       if (firstSeenTs > sinceTs && !v.archived) {
-        novos.push({ id: listingId, raw: v.raw, source: v.source, firstSeen: v.firstSeen, score: v.score });
+        novos.push({ id: listingId, raw: v.raw, source: v.source, firstSeen: v.firstSeen, mlPct: v.mlPct });
       }
       // Alterado: priceChangedAt depois do since (e não é só "novo")
       else if (priceChangedTs > sinceTs && !v.archived && firstSeenTs <= sinceTs) {
         alterados.push({
           id: listingId, raw: v.raw, source: v.source,
           price: v.price, prevPrice: v.prevPrice,
-          priceChangedAt: v.priceChangedAt, score: v.score,
+          priceChangedAt: v.priceChangedAt, mlPct: v.mlPct,
         });
       }
       // Arquivado: archivedAt depois do since
@@ -608,7 +628,7 @@ const server = http.createServer(async (req, res) => {
           analysisName: a.name,
           firstSeen: kl[listingUrl].firstSeen,
           currentPrice: kl[listingUrl].price,
-          currentScore: kl[listingUrl].score,
+          currentMargin: kl[listingUrl].mlPct,
           history: kl[listingUrl].priceHistory || [],
         });
       }
