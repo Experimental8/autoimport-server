@@ -9,6 +9,11 @@ const APIFY_AS24 = 'ivanvs/autoscout-scraper';
 const APIFY_MDE  = 'ivanvs/mobile-de-scraper';
 const APIFY_SV   = 'dadhalfdev/standvirtual-scraper';
 
+// Versão da aplicação — usar formato YYYY-MM-DD-N (incrementar N se vários pushes no mesmo dia)
+// Esta tem que coincidir com APP_VERSION no autoimport_v5.html
+const APP_VERSION = '2026-04-28-1';
+const APP_BUILT_AT = new Date().toISOString();
+
 // Sync SV: refrescar referência PT a cada 2 dias (em ms)
 const SV_SYNC_INTERVAL_MS = 2 * 24 * 60 * 60 * 1000;
 
@@ -504,6 +509,10 @@ const server = http.createServer(async (req, res) => {
   if (req.method === 'GET' && u.pathname === '/health') {
     const data = loadData();
     return ok(res, { ok: true, analyses: data.analyses.length, time: new Date().toISOString() });
+  }
+
+  if (req.method === 'GET' && u.pathname === '/version') {
+    return ok(res, { version: APP_VERSION, builtAt: APP_BUILT_AT });
   }
 
   if (req.method === 'GET' && u.pathname === '/analyses') {
