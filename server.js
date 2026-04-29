@@ -11,7 +11,7 @@ const APIFY_SV   = 'dadhalfdev/standvirtual-scraper';
 
 // Versão da aplicação — usar formato YYYY-MM-DD-N (incrementar N se vários pushes no mesmo dia)
 // Esta tem que coincidir com APP_VERSION no autoimport_v5.html
-const APP_VERSION = '2026-04-29-15';
+const APP_VERSION = '2026-04-29-18';
 const APP_BUILT_AT = new Date().toISOString();
 
 // Sync SV: refrescar referência PT a cada 2 dias (em ms)
@@ -58,26 +58,30 @@ function encodeNtfyHeader(val) {
 }
 
 async function notify(channel, title, message, priority = 'default', analysisId = null, subtitle = null, listingUrl = null) {
-  if (!channel) return;
-  try {
-    // ntfy não tem subtítulo nativo — prepend ao message como linha em destaque
-    const fullMessage = subtitle ? `${subtitle}\n${'─'.repeat(20)}\n${message}` : message;
-    await fetch(`https://ntfy.sh/${channel}`, {
-      method: 'POST',
-      headers: { 'Title': encodeNtfyHeader(title), 'Priority': priority, 'Tags': 'car,autoimport' },
-      body: fullMessage,
-    });
-  } catch (e) { console.error('ntfy error:', e.message); }
+  // Push via ntfy: só se houver canal configurado
+  if (channel) {
+    try {
+      // ntfy não tem subtítulo nativo — prepend ao message como linha em destaque
+      const fullMessage = subtitle ? `${subtitle}\n${'─'.repeat(20)}\n${message}` : message;
+      await fetch(`https://ntfy.sh/${channel}`, {
+        method: 'POST',
+        headers: { 'Title': encodeNtfyHeader(title), 'Priority': priority, 'Tags': 'car,autoimport' },
+        body: fullMessage,
+      });
+    } catch (e) { console.error('ntfy error:', e.message); }
+  }
 
-  // Save to history (7 days)
+  // Histórico (7 dias) — SEMPRE guardado, mesmo sem canal ntfy.
+  // Este é o feed que aparece na vista "Notificações" da app.
   const data = loadData();
   if (!data.notifications) data.notifications = [];
   data.notifications.push({
-    id: Date.now(),
+    id: Date.now() + Math.floor(Math.random() * 1000),  // evita colisões em chamadas rápidas
     analysisId,
     listingUrl,
     title,
     message,
+    subtitle: subtitle || null,
     priority,
     ts: new Date().toISOString(),
     read: false,
