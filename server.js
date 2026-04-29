@@ -11,7 +11,7 @@ const APIFY_SV   = 'dadhalfdev/standvirtual-scraper';
 
 // Versão da aplicação — usar formato YYYY-MM-DD-N (incrementar N se vários pushes no mesmo dia)
 // Esta tem que coincidir com APP_VERSION no autoimport_v5.html
-const APP_VERSION = '2026-04-29-12';
+const APP_VERSION = '2026-04-29-15';
 const APP_BUILT_AT = new Date().toISOString();
 
 // Sync SV: refrescar referência PT a cada 2 dias (em ms)
@@ -822,6 +822,57 @@ const server = http.createServer(async (req, res) => {
     ok(res, { ok: true, message: 'Sync started' });
     syncAll().catch(console.error);
     return;
+  }
+
+  // ── Specs cache (compartilhado entre dispositivos e utilizadores) ──────
+  // GET /specs-cache → devolve todo o cache { key: {co2, cilindrada, ...} }
+  // Cliente faz lookup local sem round-trip.
+  // Cresce até ~1000 entries (~80KB) — tamanho insignificante.
+  if (req.method === 'GET' && u.pathname === '/specs-cache') {
+    const data = loadData();
+    return ok(res, data.specsCache || {});
+  }
+
+  // POST /specs-cache → recebe batch de novas entries para adicionar/atualizar
+  // Body: [{ key, co2, cilindrada, co2_norma, co2_conf }, ...]
+  // Útil para escrever várias entries de uma vez (ex: após processar Fase 2)
+  if (req.method === 'POST' && u.pathname === '/specs-cache') {
+    try {
+      const body = await readBody(req);
+      const entries = JSON.parse(body || '[]');
+      if (!Array.isArray(entries)) return err(res, 'Body must be array', 400);
+      const data = loadData();
+      if (!data.specsCache) data.specsCache = {};
+      let added = 0;
+      entries.forEach(e => {
+        if (!e.key) return;
+        data.specsCache[e.key] = {
+          co2: e.co2 || 0,
+          cilindrada: e.cilindrada || 0,
+          co2_norma: e.co2_norma || 'WLTP',
+          co2_conf: e.co2_conf || 'média',
+          ts: Date.now()
+        };
+        added++;
+      });
+      // Limit a 1000 entries — drop oldest (FIFO por timestamp)
+      const keys = Object.keys(data.specsCache);
+      if (keys.length > 1000) {
+        const sorted = keys.sort((a,b) => (data.specsCache[a].ts||0) - (data.specsCache[b].ts||0));
+        sorted.slice(0, keys.length - 1000).forEach(k => delete data.specsCache[k]);
+      }
+      saveData(data);
+      return ok(res, { ok: true, added, total: Object.keys(data.specsCache).length });
+    } catch(e){ return err(res, e.message, 400); }
+  }
+
+  // DELETE /specs-cache → limpar tudo (debug)
+  if (req.method === 'DELETE' && u.pathname === '/specs-cache') {
+    const data = loadData();
+    const before = Object.keys(data.specsCache || {}).length;
+    data.specsCache = {};
+    saveData(data);
+    return ok(res, { ok: true, removed: before });
   }
 
   err(res, 'Not found', 404);
