@@ -11,7 +11,7 @@ const APIFY_SV   = 'dadhalfdev/standvirtual-scraper';
 
 // Versão da aplicação — usar formato YYYY-MM-DD-N (incrementar N se vários pushes no mesmo dia)
 // Esta tem que coincidir com APP_VERSION no autoimport_v5.html
-const APP_VERSION = '2026-04-29-9';
+const APP_VERSION = '2026-04-29-12';
 const APP_BUILT_AT = new Date().toISOString();
 
 // Sync SV: refrescar referência PT a cada 2 dias (em ms)
@@ -797,6 +797,25 @@ const server = http.createServer(async (req, res) => {
     if (n) n.read = true;
     saveData(data);
     return ok(res, { ok: true });
+  }
+
+  // DELETE /notifications/<id> — apaga uma notificação
+  if (req.method === 'DELETE' && u.pathname.startsWith('/notifications/')) {
+    const id = parseInt(u.pathname.split('/').pop());
+    const data = loadData();
+    const before = (data.notifications || []).length;
+    data.notifications = (data.notifications || []).filter(n => n.id !== id);
+    saveData(data);
+    return ok(res, { ok: true, removed: before - data.notifications.length });
+  }
+
+  // DELETE /notifications — apaga todas
+  if (req.method === 'DELETE' && u.pathname === '/notifications') {
+    const data = loadData();
+    const before = (data.notifications || []).length;
+    data.notifications = [];
+    saveData(data);
+    return ok(res, { ok: true, removed: before });
   }
 
   if (req.method === 'POST' && u.pathname === '/sync') {
