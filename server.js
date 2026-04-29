@@ -11,7 +11,7 @@ const APIFY_SV   = 'dadhalfdev/standvirtual-scraper';
 
 // Versão da aplicação — usar formato YYYY-MM-DD-N (incrementar N se vários pushes no mesmo dia)
 // Esta tem que coincidir com APP_VERSION no autoimport_v5.html
-const APP_VERSION = '2026-04-29-18';
+const APP_VERSION = '2026-04-29-20';
 const APP_BUILT_AT = new Date().toISOString();
 
 // Sync SV: refrescar referência PT a cada 2 dias (em ms)
@@ -38,9 +38,10 @@ async function scrapeUrl(actorId, url, maxItems = 100) {
 }
 
 // StandVirtual usa formato diferente: input_url string (não objecto)
-async function scrapeUrlSV(url, maxItems = 100) {
+// Actor browser-based, lento. 50 carros dão mediana robusta. 8GB RAM acelera ~2× vs 4GB.
+async function scrapeUrlSV(url, maxItems = 50) {
   const endpoint = `https://api.apify.com/v2/acts/${encodeURIComponent(APIFY_SV)}/run-sync-get-dataset-items`;
-  const params = new URLSearchParams({ token: APIFY_TOKEN, maxItems, format: 'json' });
+  const params = new URLSearchParams({ token: APIFY_TOKEN, maxItems, format: 'json', memory: '8192' });
   const input = { input_url: url, maxItems };
   const resp = await fetch(`${endpoint}?${params}`, {
     method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(input),
