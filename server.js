@@ -11,7 +11,7 @@ const APIFY_SV   = 'dadhalfdev/standvirtual-scraper';
 
 // Versão da aplicação — usar formato YYYY-MM-DD-N (incrementar N se vários pushes no mesmo dia)
 // Esta tem que coincidir com APP_VERSION no autoimport_v5.html
-const APP_VERSION = '2026-04-29-22';
+const APP_VERSION = '2026-04-30-2';
 const APP_BUILT_AT = new Date().toISOString();
 
 // Sync SV: refrescar referência PT a cada 2 dias (em ms)
@@ -541,13 +541,14 @@ const server = http.createServer(async (req, res) => {
     return ok(res, { version: APP_VERSION, builtAt: APP_BUILT_AT });
   }
 
-  // POST /admin/wipe — apaga TODOS os dados do servidor (analyses + notifications)
-  // Sem autenticação por simplicidade (B2B com 2 utilizadores). Usar só uma vez na migração para Margem%.
+  // POST /admin/wipe — apaga TODOS os dados do servidor
+  // Sem autenticação por simplicidade (B2B com 2 utilizadores).
+  // Apaga: analyses, notifications, backup, specsCache. Faz "fábrica zero".
   if (req.method === 'POST' && u.pathname === '/admin/wipe') {
     try {
-      saveData({ analyses: [], notifications: [] });
-      console.log(`[${new Date().toISOString()}] ⚠️  /admin/wipe: dados apagados`);
-      return ok(res, { ok: true, message: 'Todos os dados apagados (analyses + notifications)' });
+      saveData({ analyses: [], notifications: [], backup: null, specsCache: {} });
+      console.log(`[${new Date().toISOString()}] ⚠️  /admin/wipe: TUDO apagado (analyses, notifications, backup, specsCache)`);
+      return ok(res, { ok: true, message: 'Todos os dados apagados (analyses + notifications + backup + specsCache)' });
     } catch (e) {
       return err(res, e.message);
     }
@@ -566,10 +567,57 @@ const server = http.createServer(async (req, res) => {
       const payload = await readBody(req);
       const data = loadData();
       const idx = data.analyses.findIndex(a => a.id === payload.id);
+
+      // Extrair existingUrls (não persistir no analysis directamente — é input para knownListings)
+      const existingUrls = Array.isArray(payload.existingUrls) ? payload.existingUrls : null;
+      const cleanPayload = { ...payload };
+      delete cleanPayload.existingUrls;
+
       if (idx >= 0) {
-        data.analyses[idx] = { ...data.analyses[idx], ...payload };
+        data.analyses[idx] = { ...data.analyses[idx], ...cleanPayload };
+        // Se análise já existe e cliente envia existingUrls, popular knownListings
+        // dos URLs que ainda não estão lá. Usa firstSeen=epoch (1970) para garantir
+        // que NÃO contam como novidade quando o cliente fizer GET /delta?since=AGORA.
+        if (existingUrls){
+          if (!data.analyses[idx].knownListings) data.analyses[idx].knownListings = {};
+          const kl = data.analyses[idx].knownListings;
+          const epoch = '1970-01-01T00:00:00.000Z';
+          let added = 0;
+          for (const url of existingUrls){
+            if (!url) continue;
+            if (!kl[url]){
+              kl[url] = {
+                raw: null, source: null,
+                price: null, prevPrice: null,
+                priceChangedAt: null, mlPct: null,
+                firstSeen: epoch,            // ← garante que NÃO conta como novo
+                lastSeen: epoch,
+                missingCount: 0,
+                archived: false, archivedAt: null,
+              };
+              added++;
+            }
+          }
+          if (added > 0) console.log(`POST /analyses: pré-populadas ${added} known listings para análise ${cleanPayload.id}`);
+        }
       } else {
-        data.analyses.push({ knownListings: {}, lastSync: null, ...payload });
+        const newAnalysis = { knownListings: {}, lastSync: null, ...cleanPayload };
+        // Mesmo tratamento para análise nova: pré-popular knownListings
+        if (existingUrls){
+          const epoch = '1970-01-01T00:00:00.000Z';
+          for (const url of existingUrls){
+            if (!url) continue;
+            newAnalysis.knownListings[url] = {
+              raw: null, source: null,
+              price: null, prevPrice: null,
+              priceChangedAt: null, mlPct: null,
+              firstSeen: epoch, lastSeen: epoch,
+              missingCount: 0, archived: false, archivedAt: null,
+            };
+          }
+          console.log(`POST /analyses: análise nova ${cleanPayload.id} pré-populada com ${existingUrls.length} known listings`);
+        }
+        data.analyses.push(newAnalysis);
       }
       saveData(data);
       return ok(res, { ok: true });
