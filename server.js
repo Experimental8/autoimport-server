@@ -11,7 +11,7 @@ const APIFY_SV   = 'dadhalfdev/standvirtual-scraper';
 
 // Versão da aplicação — usar formato YYYY-MM-DD-N (incrementar N se vários pushes no mesmo dia)
 // Esta tem que coincidir com APP_VERSION no autoimport_v5.html
-const APP_VERSION = '2026-04-30-10';
+const APP_VERSION = '2026-04-30-11';
 const APP_BUILT_AT = new Date().toISOString();
 
 // Sync SV: refrescar referência PT a cada 2 dias (em ms)
@@ -93,17 +93,41 @@ async function notify(channel, title, message, priority = 'default', analysisId 
 }
 
 // ── Helpers ───────────────────────────────────────────────────────────────
+// Apify devolve JSON aninhado por defeito ({properties: {milage: "..."}}).
+// O resto do código procura chaves planas com slash ({'properties/milage': "..."}).
+// Esta função aplana o raw recursivamente — idempotente, preserva arrays.
+// Bug histórico 2026-04-30: 42 BMW M3 vindos do scrape do servidor ficaram com
+// preço=null porque getPrice procurava 'price/amount' mas o raw tinha price.amount
+// aninhado. Cliente também falhou ao processar pelo mesmo motivo.
+function flattenRaw(obj, prefix){
+  prefix = prefix || '';
+  if(!obj || typeof obj !== 'object' || Array.isArray(obj)) return obj;
+  const out = {};
+  for(const k in obj){
+    if(!Object.prototype.hasOwnProperty.call(obj, k)) continue;
+    const v = obj[k];
+    const newKey = prefix ? prefix + '/' + k : k;
+    if(v && typeof v === 'object' && !Array.isArray(v)){
+      Object.assign(out, flattenRaw(v, newKey));
+    } else {
+      out[newKey] = v;
+    }
+  }
+  return out;
+}
+
 function getId(r) { return r.url || r.id || null; }
 
 function getPrice(r) {
+  r = flattenRaw(r);
   const raw = r['price/amount'] || r.rawPrice || r.price || '';
   const n = parseFloat(String(raw).replace(/[^0-9.]/g, ''));
   return isNaN(n) ? null : n;
 }
 
-function getMake(r)  { return r.manufacturer || r.make || ''; }
-function getModel(r) { return r.model || ''; }
-function getKm(r)    { return r['properties/milage'] || r.milage || ''; }
+function getMake(r)  { r = flattenRaw(r); return r.manufacturer || r.make || ''; }
+function getModel(r) { r = flattenRaw(r); return r.model || ''; }
+function getKm(r)    { r = flattenRaw(r); return r['properties/milage'] || r.milage || ''; }
 function fmt(n)      { return n != null ? n.toLocaleString('pt-PT') : '—'; }
 function fmtEur(n)   { return n != null ? '€' + n.toLocaleString('pt-PT') : '€—'; }
 
@@ -129,10 +153,12 @@ const ISV_BY_FUEL_SIMPLIFIED = {
 const LEGAL_FIXED = 1000; // legalização média
 
 function getCountry(r) {
+  r = flattenRaw(r);
   return r['vehicle/country'] || r['dealer/contry'] || r['dealer/address/contry'] || r.country || r['vehicleLocation/country'] || 'D';
 }
 
 function getFuel(r) {
+  r = flattenRaw(r);
   return r['vehicle/fuel'] || r.fuel || r['fuelType'] || r['properties/fuelType'] || '';
 }
 
@@ -281,7 +307,8 @@ async function syncAnalysis(analysis) {
     return { passes, mlPct, calc };
   };
 
-  for (const r of freshOrigin) {
+  for (const rawItem of freshOrigin) {
+    const r = flattenRaw(rawItem);  // garante chaves planas para todo o loop
     const id = getId(r);
     if (!id) continue;
     const price = getPrice(r);
@@ -655,12 +682,12 @@ const server = http.createServer(async (req, res) => {
 
       // Novo: firstSeen depois do since
       if (firstSeenTs > sinceTs && !v.archived) {
-        novos.push({ id: listingId, raw: v.raw, source: v.source, firstSeen: v.firstSeen, mlPct: v.mlPct });
+        novos.push({ id: listingId, raw: flattenRaw(v.raw), source: v.source, firstSeen: v.firstSeen, mlPct: v.mlPct });
       }
       // Alterado: priceChangedAt depois do since (e não é só "novo")
       else if (priceChangedTs > sinceTs && !v.archived && firstSeenTs <= sinceTs) {
         alterados.push({
-          id: listingId, raw: v.raw, source: v.source,
+          id: listingId, raw: flattenRaw(v.raw), source: v.source,
           price: v.price, prevPrice: v.prevPrice,
           priceChangedAt: v.priceChangedAt, mlPct: v.mlPct,
         });
