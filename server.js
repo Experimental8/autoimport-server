@@ -11,7 +11,7 @@ const APIFY_SV   = 'dadhalfdev/standvirtual-scraper';
 
 // Versão da aplicação — usar formato YYYY-MM-DD-N (incrementar N se vários pushes no mesmo dia)
 // Esta tem que coincidir com APP_VERSION no autoimport_v5.html
-const APP_VERSION = '2026-04-30-6';
+const APP_VERSION = '2026-04-30-8';
 const APP_BUILT_AT = new Date().toISOString();
 
 // Sync SV: refrescar referência PT a cada 2 dias (em ms)
@@ -933,13 +933,16 @@ const server = http.createServer(async (req, res) => {
 
 const PORT = process.env.PORT || 3000;
 server.listen(PORT, () => console.log(`AutoImport server running on port ${PORT}`));
-// Sync às 08h, 12h, 14h30 e 17h30 — todos os dias incluindo fim-de-semana
+// Sync às 08h, 12h, 14h30 e 17h30 — hora de Lisboa (PT). Sem `timezone` explícita,
+// node-cron usa o TZ do processo, que no Railway é UTC → no horário de verão
+// (CEST, UTC+1) os crons corriam 1h atrasados (08h Lisboa → 09h real).
+// Bug detectado em produção 2026-04-30: análise tinha cron das 12h a disparar às 13h.
 const syncTimes = ['0 8 * * *', '0 12 * * *', '30 14 * * *', '30 17 * * *'];
 syncTimes.forEach(expr => {
   cron.schedule(expr, () => {
     console.log(`⏰ Sync scheduled: ${expr}`);
     syncAll().catch(console.error);
-  });
+  }, { timezone: 'Europe/Lisbon' });
 });
-console.log('✅ Cron: 08h, 12h, 14h30, 17h30 — todos os dias');
+console.log('✅ Cron: 08h, 12h, 14h30, 17h30 (Europe/Lisbon) — todos os dias');
 syncAll().catch(console.error);
