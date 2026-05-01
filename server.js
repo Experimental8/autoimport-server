@@ -11,7 +11,7 @@ const APIFY_SV   = 'dadhalfdev/standvirtual-scraper';
 
 // Versão da aplicação — usar formato YYYY-MM-DD-N (incrementar N se vários pushes no mesmo dia)
 // Esta tem que coincidir com APP_VERSION no autoimport_v5.html
-const APP_VERSION = '2026-04-30-12';
+const APP_VERSION = '2026-04-30-13';
 const APP_BUILT_AT = new Date().toISOString();
 
 // Sync SV: refrescar referência PT a cada 2 dias (em ms)
@@ -251,34 +251,44 @@ async function syncSV(analysis) {
   return true;
 }
 
-async function syncAnalysis(analysis) {
+async function syncAnalysis(analysis, injectedFreshOrigin) {
   // Filtros suportados: minMarginPct (principal) + maxPrice (segurança extra)
   const { name, searchUrls, ntfyChannel, minMarginPct = 0.05, maxPrice = 0, cachedRef } = analysis;
-  if (!searchUrls?.length) return;
-  console.log(`[${new Date().toISOString()}] Syncing: ${name} (minMargin=${Math.round(minMarginPct*100)}% maxPrice=${maxPrice || 'none'})`);
+  // Se vier injectedFreshOrigin (ingest manual), salta scrape Apify.
+  // Útil para testes end-to-end ou re-sincronização a partir de CSVs locais.
+  if (!injectedFreshOrigin && !searchUrls?.length) return;
+  const mode = injectedFreshOrigin ? 'INGEST' : 'SCRAPE';
+  console.log(`[${new Date().toISOString()}] Syncing (${mode}): ${name} (minMargin=${Math.round(minMarginPct*100)}% maxPrice=${maxPrice || 'none'})`);
 
-  // Paraleliza chamadas Apify (AS24, MDE) — antes era sequencial, agora todas em simultâneo.
-  // Promise.allSettled garante que falha de uma fonte não cancela as outras.
-  const scrapeTargets = searchUrls.filter(s => s.source !== 'sv');
-  const scrapeResults = await Promise.allSettled(
-    scrapeTargets.map(async ({ url, source }) => {
-      const actor = source === 'mde' ? APIFY_MDE : APIFY_AS24;
-      const rows = await scrapeUrl(actor, url);
-      return { source, rows };
-    })
-  );
+  let freshOrigin;
+  if (injectedFreshOrigin) {
+    // Modo ingest: usa raws fornecidos (já com _src injectado pelo cliente)
+    freshOrigin = injectedFreshOrigin;
+    console.log(`  INGEST: ${freshOrigin.length} raws recebidos`);
+  } else {
+    // Modo normal: paraleliza chamadas Apify (AS24, MDE) — antes era sequencial, agora todas em simultâneo.
+    // Promise.allSettled garante que falha de uma fonte não cancela as outras.
+    const scrapeTargets = searchUrls.filter(s => s.source !== 'sv');
+    const scrapeResults = await Promise.allSettled(
+      scrapeTargets.map(async ({ url, source }) => {
+        const actor = source === 'mde' ? APIFY_MDE : APIFY_AS24;
+        const rows = await scrapeUrl(actor, url);
+        return { source, rows };
+      })
+    );
 
-  const freshOrigin = [];
-  scrapeResults.forEach((result, i) => {
-    const { source } = scrapeTargets[i];
-    if (result.status === 'fulfilled') {
-      const { rows } = result.value;
-      freshOrigin.push(...rows.map(r => ({ ...r, _src: source })));
-      console.log(`  ${source.toUpperCase()}: ${rows.length}`);
-    } else {
-      console.error(`  ${source} error:`, result.reason?.message || result.reason);
-    }
-  });
+    freshOrigin = [];
+    scrapeResults.forEach((result, i) => {
+      const { source } = scrapeTargets[i];
+      if (result.status === 'fulfilled') {
+        const { rows } = result.value;
+        freshOrigin.push(...rows.map(r => ({ ...r, _src: source })));
+        console.log(`  ${source.toUpperCase()}: ${rows.length}`);
+      } else {
+        console.error(`  ${source} error:`, result.reason?.message || result.reason);
+      }
+    });
+  }
 
   // Modo aprendizagem: primeira sync nunca notifica, só regista
   const isFirstSync = !analysis.lastSync;
@@ -902,6 +912,37 @@ const server = http.createServer(async (req, res) => {
     ok(res, { ok: true, message: 'Sync started' });
     syncAll().catch(console.error);
     return;
+  }
+
+  // POST /analyses/:id/ingest
+  // Body: { raws: [{...rawApify, _src: 'as24'|'mde'}, ...] }
+  // Funciona como sync mas usa raws fornecidos pelo cliente em vez de chamar Apify.
+  // Útil para testes end-to-end, re-sincronização a partir de CSVs locais, e
+  // evita custos do scrape quando já temos os dados.
+  if (req.method === 'POST' && /^\/analyses\/[^/]+\/ingest$/.test(u.pathname)) {
+    try {
+      const id = u.pathname.split('/')[2];
+      const body = await readBody(req);
+      const raws = Array.isArray(body?.raws) ? body.raws : null;
+      if (!raws) return err(res, 'raws array required in body', 400);
+
+      const data = loadData();
+      const analysis = (data.analyses || []).find(x => String(x.id) === String(id));
+      if (!analysis) return err(res, 'analysis not found', 404);
+
+      // Garantir que cada raw tem _src (default 'as24' se ausente — defensivo)
+      const freshOrigin = raws.map(r => ({ ...r, _src: r._src || 'as24' }));
+
+      // Responde imediatamente, processa em background (igual a POST /sync)
+      ok(res, { ok: true, message: `Ingest iniciado: ${freshOrigin.length} raws` });
+      syncAnalysis(analysis, freshOrigin)
+        .then(() => {
+          saveData(data);
+          console.log(`[INGEST] ${analysis.name}: concluído, ${Object.keys(analysis.knownListings || {}).length} known listings`);
+        })
+        .catch(e => console.error(`[INGEST] ${analysis.name} falhou:`, e));
+      return;
+    } catch (e) { return err(res, e.message); }
   }
 
   // ── Specs cache (compartilhado entre dispositivos e utilizadores) ──────
