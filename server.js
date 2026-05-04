@@ -11,7 +11,7 @@ const APIFY_SV   = 'dadhalfdev/standvirtual-scraper';
 
 // Versão da aplicação — usar formato YYYY-MM-DD-N (incrementar N se vários pushes no mesmo dia)
 // Esta tem que coincidir com APP_VERSION no autoimport_v5.html
-const APP_VERSION = '2026-05-04-2';
+const APP_VERSION = '2026-05-04-4';
 const APP_BUILT_AT = new Date().toISOString();
 
 // Sync SV: refrescar referência PT a cada 2 dias (em ms)
@@ -672,6 +672,26 @@ const server = http.createServer(async (req, res) => {
       const cleanPayload = { ...payload };
       delete cleanPayload.existingUrls;
 
+      // Last-write-wins com timestamp para syncEnabled.
+      // Bug histórico (até 2026-05-04): se o dispositivo A desligava sync e o dispositivo B
+      // sincronizava do backup logo a seguir (com estado antigo), o re-push do B
+      // sobrescrevia o `false` do A com `true`. Resultado: cron continuava a chamar Apify
+      // mesmo com sync desligado.
+      // Fix: se o cliente envia syncEnabledUpdatedAt mais antigo que o que o servidor
+      // tem registado, ignoramos a mudança de syncEnabled (mas aceitamos restantes campos).
+      if (idx >= 0 && cleanPayload.syncEnabled !== undefined) {
+        const existing = data.analyses[idx];
+        const incomingTs  = cleanPayload.syncEnabledUpdatedAt
+          ? new Date(cleanPayload.syncEnabledUpdatedAt).getTime() : 0;
+        const existingTs  = existing.syncEnabledUpdatedAt
+          ? new Date(existing.syncEnabledUpdatedAt).getTime() : 0;
+        if (existingTs > 0 && incomingTs < existingTs) {
+          console.log(`POST /analyses: rejeito syncEnabled stale (${cleanPayload.id}). incoming=${incomingTs} existing=${existingTs}`);
+          delete cleanPayload.syncEnabled;
+          delete cleanPayload.syncEnabledUpdatedAt;
+        }
+      }
+
       if (idx >= 0) {
         data.analyses[idx] = { ...data.analyses[idx], ...cleanPayload };
         // Se análise já existe e cliente envia existingUrls, popular knownListings
@@ -719,7 +739,14 @@ const server = http.createServer(async (req, res) => {
         data.analyses.push(newAnalysis);
       }
       saveData(data);
-      return ok(res, { ok: true });
+      // Devolve o estado autoritativo do servidor para o cliente reconciliar
+      const finalIdx = data.analyses.findIndex(a => a.id === payload.id);
+      const final = finalIdx >= 0 ? data.analyses[finalIdx] : null;
+      return ok(res, {
+        ok: true,
+        syncEnabled: final?.syncEnabled,
+        syncEnabledUpdatedAt: final?.syncEnabledUpdatedAt
+      });
     } catch (e) { return err(res, e.message); }
   }
 
