@@ -3,7 +3,37 @@ const fetch = require('node-fetch');
 const fs    = require('fs');
 const http  = require('http');
 
-const DATA_FILE  = './data.json';
+const path  = require('path');
+
+// Caminho de persistência: se o Railway montou um volume, usa-o (sobrevive a deploys/restarts).
+// Caso contrário, fallback para './data.json' no working dir (modo desenvolvimento ou
+// servidor sem volume — comportamento histórico).
+// Bug histórico (até 2026-05-04): o filesystem do Railway era efémero. Cada redeploy
+// apagava knownListings, notifications, e analyses. Mitigação manual: backup antes de
+// cada deploy. Fix: volume persistente — RAILWAY_VOLUME_MOUNT_PATH é set automaticamente
+// pelo Railway em runtime quando há volume configurado no dashboard.
+const VOLUME_PATH = process.env.RAILWAY_VOLUME_MOUNT_PATH || null;
+const DATA_FILE   = VOLUME_PATH ? path.join(VOLUME_PATH, 'data.json') : './data.json';
+const LEGACY_DATA = './data.json';
+
+// Migração transparente: na primeira vez que arrancamos com volume montado, se o ficheiro
+// não existe no volume mas existe no caminho legacy (deploy anterior), copia-o.
+// Idempotente: só corre se faz sentido (volume vazio + legacy presente).
+if (VOLUME_PATH) {
+  try {
+    if (!fs.existsSync(VOLUME_PATH)) fs.mkdirSync(VOLUME_PATH, { recursive: true });
+    if (!fs.existsSync(DATA_FILE) && fs.existsSync(LEGACY_DATA)) {
+      fs.copyFileSync(LEGACY_DATA, DATA_FILE);
+      console.log(`📦 Migração: data.json copiado de ${LEGACY_DATA} para ${DATA_FILE}`);
+    }
+    console.log(`💾 Persistência: ${DATA_FILE} (volume montado em ${VOLUME_PATH})`);
+  } catch (e) {
+    console.error(`⚠ Erro a inicializar volume:`, e.message);
+  }
+} else {
+  console.log(`💾 Persistência: ${DATA_FILE} (sem volume — efémero)`);
+}
+
 const APIFY_TOKEN = process.env.APIFY_TOKEN;
 const APIFY_AS24 = 'ivanvs/autoscout-scraper';
 const APIFY_MDE  = 'ivanvs/mobile-de-scraper';
@@ -11,7 +41,7 @@ const APIFY_SV   = 'dadhalfdev/standvirtual-scraper';
 
 // Versão da aplicação — usar formato YYYY-MM-DD-N (incrementar N se vários pushes no mesmo dia)
 // Esta tem que coincidir com APP_VERSION no autoimport_v5.html
-const APP_VERSION = '2026-05-04-4';
+const APP_VERSION = '2026-05-04-5';
 const APP_BUILT_AT = new Date().toISOString();
 
 // Sync SV: refrescar referência PT a cada 2 dias (em ms)
