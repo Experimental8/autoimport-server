@@ -11,7 +11,7 @@ const APIFY_SV   = 'dadhalfdev/standvirtual-scraper';
 
 // Versão da aplicação — usar formato YYYY-MM-DD-N (incrementar N se vários pushes no mesmo dia)
 // Esta tem que coincidir com APP_VERSION no autoimport_v5.html
-const APP_VERSION = '2026-04-30-13';
+const APP_VERSION = '2026-05-04-1';
 const APP_BUILT_AT = new Date().toISOString();
 
 // Sync SV: refrescar referência PT a cada 2 dias (em ms)
@@ -251,48 +251,52 @@ async function syncSV(analysis) {
   return true;
 }
 
-async function syncAnalysis(analysis, injectedFreshOrigin) {
-  // Filtros suportados: minMarginPct (principal) + maxPrice (segurança extra)
-  const { name, searchUrls, ntfyChannel, minMarginPct = 0.05, maxPrice = 0, cachedRef } = analysis;
-  // Se vier injectedFreshOrigin (ingest manual), salta scrape Apify.
-  // Útil para testes end-to-end ou re-sincronização a partir de CSVs locais.
-  if (!injectedFreshOrigin && !searchUrls?.length) return;
-  const mode = injectedFreshOrigin ? 'INGEST' : 'SCRAPE';
-  console.log(`[${new Date().toISOString()}] Syncing (${mode}): ${name} (minMargin=${Math.round(minMarginPct*100)}% maxPrice=${maxPrice || 'none'})`);
+// ── Sync — peças ──────────────────────────────────────────────────────────
+// syncAnalysis foi decomposta em 5 peças nomeadas para legibilidade.
+// O orquestrador `syncAnalysis` chama-as por ordem. Comportamento idêntico ao anterior,
+// excepto por uma adição: deduplicação cross-source nas notificações (evita push duplicado
+// quando o mesmo carro aparece em AS24+MDE). knownListings continua a guardar ambos —
+// o cliente faz uma 2ª camada de dedup ao integrar.
 
-  let freshOrigin;
+// ── 1. Recolher anúncios — Apify paralelo, ou usar raws fornecidos via /ingest ──
+async function recolherAnuncios(analysis, injectedFreshOrigin) {
   if (injectedFreshOrigin) {
     // Modo ingest: usa raws fornecidos (já com _src injectado pelo cliente)
-    freshOrigin = injectedFreshOrigin;
-    console.log(`  INGEST: ${freshOrigin.length} raws recebidos`);
-  } else {
-    // Modo normal: paraleliza chamadas Apify (AS24, MDE) — antes era sequencial, agora todas em simultâneo.
-    // Promise.allSettled garante que falha de uma fonte não cancela as outras.
-    const scrapeTargets = searchUrls.filter(s => s.source !== 'sv');
-    const scrapeResults = await Promise.allSettled(
-      scrapeTargets.map(async ({ url, source }) => {
-        const actor = source === 'mde' ? APIFY_MDE : APIFY_AS24;
-        const rows = await scrapeUrl(actor, url);
-        return { source, rows };
-      })
-    );
-
-    freshOrigin = [];
-    scrapeResults.forEach((result, i) => {
-      const { source } = scrapeTargets[i];
-      if (result.status === 'fulfilled') {
-        const { rows } = result.value;
-        freshOrigin.push(...rows.map(r => ({ ...r, _src: source })));
-        console.log(`  ${source.toUpperCase()}: ${rows.length}`);
-      } else {
-        console.error(`  ${source} error:`, result.reason?.message || result.reason);
-      }
-    });
+    console.log(`  INGEST: ${injectedFreshOrigin.length} raws recebidos`);
+    return injectedFreshOrigin;
   }
+  // Modo normal: paraleliza chamadas Apify (AS24, MDE) — antes era sequencial.
+  // Promise.allSettled garante que falha de uma fonte não cancela as outras.
+  const scrapeTargets = (analysis.searchUrls || []).filter(s => s.source !== 'sv');
+  const scrapeResults = await Promise.allSettled(
+    scrapeTargets.map(async ({ url, source }) => {
+      const actor = source === 'mde' ? APIFY_MDE : APIFY_AS24;
+      const rows = await scrapeUrl(actor, url);
+      return { source, rows };
+    })
+  );
+  const freshOrigin = [];
+  scrapeResults.forEach((result, i) => {
+    const { source } = scrapeTargets[i];
+    if (result.status === 'fulfilled') {
+      const { rows } = result.value;
+      freshOrigin.push(...rows.map(r => ({ ...r, _src: source })));
+      console.log(`  ${source.toUpperCase()}: ${rows.length}`);
+    } else {
+      console.error(`  ${source} error:`, result.reason?.message || result.reason);
+    }
+  });
+  return freshOrigin;
+}
 
+// ── 2. Classificar listings — para cada raw, decidir se é novo, conhecido, ou alterado ──
+// Modifica analysis.knownListings in-place. Devolve { newListings, priceDrops, isFirstSync }.
+function classificarListings(analysis, freshOrigin) {
+  const { minMarginPct = 0.05, maxPrice = 0, cachedRef } = analysis;
   // Modo aprendizagem: primeira sync nunca notifica, só regista
   const isFirstSync = !analysis.lastSync;
-  const knownListings = analysis.knownListings || {};
+  if (!analysis.knownListings) analysis.knownListings = {};
+  const knownListings = analysis.knownListings;
   const newListings = [];
   const priceDrops = [];
 
@@ -300,20 +304,14 @@ async function syncAnalysis(analysis, injectedFreshOrigin) {
   const evaluate = (r) => {
     const price = getPrice(r);
     if (!price) return { passes: false, mlPct: null, calc: null };
-
     // Hard limit: maxPrice (se definido)
     if (maxPrice > 0 && price > maxPrice) {
       return { passes: false, reason: 'over-maxPrice', mlPct: null, calc: null };
     }
-
-    // Margem (precisa cachedRef)
+    // Margem (precisa cachedRef). Sem cachedRef: notifica tudo (não consegue decidir).
     const calc = cachedRef ? calcQuickScore(r, cachedRef) : null;
     const mlPct = calc?.mlPct ?? null;
-
-    // Sem cachedRef: notifica tudo (não consegue decidir)
-    // Com cachedRef: só notifica se mlPct >= minMarginPct
     const passes = mlPct == null ? true : mlPct >= minMarginPct;
-
     return { passes, mlPct, calc };
   };
 
@@ -331,17 +329,11 @@ async function syncAnalysis(analysis, injectedFreshOrigin) {
         newListings.push({ r, mlPct: evalResult.mlPct, calc: evalResult.calc });
       }
       knownListings[id] = {
-        raw: r,
-        source: r._src || null,
-        price,
-        prevPrice: null,
-        priceChangedAt: null,
+        raw: r, source: r._src || null,
+        price, prevPrice: null, priceChangedAt: null,
         mlPct: evalResult.mlPct,
-        firstSeen: nowIso,
-        lastSeen: nowIso,
-        missingCount: 0,
-        archived: false,
-        archivedAt: null,
+        firstSeen: nowIso, lastSeen: nowIso,
+        missingCount: 0, archived: false, archivedAt: null,
       };
     } else {
       // Anúncio conhecido
@@ -350,168 +342,211 @@ async function syncAnalysis(analysis, injectedFreshOrigin) {
       const priceChanged = price != null && prev.price != null && price !== prev.price;
       const wasBelow = prev.mlPct == null || prev.mlPct < minMarginPct;
       const nowPasses = evalResult.passes;
-
       // Notifica descida se: caiu de preço E agora passa no filtro
       if (priceDropped && nowPasses) {
         priceDrops.push({
           r, prev, price,
-          mlPct: evalResult.mlPct,
-          calc: evalResult.calc,
+          mlPct: evalResult.mlPct, calc: evalResult.calc,
           crossedThreshold: wasBelow
         });
       }
-
       // Actualiza estado, preservando histórico de preço se mudou
       knownListings[id] = {
         ...prev,
-        raw: r,
-        source: r._src || prev.source || null,
+        raw: r, source: r._src || prev.source || null,
         price,
         prevPrice: priceChanged ? prev.price : prev.prevPrice,
         priceChangedAt: priceChanged ? nowIso : prev.priceChangedAt,
         mlPct: evalResult.mlPct,
-        lastSeen: nowIso,
-        missingCount: 0,
+        lastSeen: nowIso, missingCount: 0,
         // Se estava arquivado e voltou a aparecer, desarquiva
         archived: false,
         archivedAt: prev.archived ? null : prev.archivedAt,
       };
     }
   }
+  return { newListings, priceDrops, isFirstSync };
+}
+
+// ── 2b. Detectar duplicado cross-source em raws ──
+// Critério apertado (espelha isSameCarTight do cliente): marca + modelo iguais
+// (case-insensitive), ano igual, km dentro 100, preço dentro 0.5%, fontes diferentes.
+// Funciona em raws (não normalizados) usando os getters getMake/getModel/getKm/getPrice.
+function _isDupCrossSourceRaw(a, b) {
+  if (a._src && b._src && a._src === b._src) return false; // tem que ser cross-source
+  const mA = String(getMake(a) || '').toLowerCase().trim();
+  const mB = String(getMake(b) || '').toLowerCase().trim();
+  if (mA && mB && mA !== mB) return false;
+  const moA = String(getModel(a) || '').toLowerCase().trim();
+  const moB = String(getModel(b) || '').toLowerCase().trim();
+  if (moA && moB && moA !== moB) return false;
+  const extractYear = s => { const m = String(s || '').match(/(\d{4})/); return m ? parseInt(m[1]) : 0; };
+  const yA = extractYear(a.firstRegistration || a['properties/firstRegistration'] || a['vehicle/firstRegistration']);
+  const yB = extractYear(b.firstRegistration || b['properties/firstRegistration'] || b['vehicle/firstRegistration']);
+  if (yA && yB && yA !== yB) return false;
+  const parseKm = v => parseInt(String(v || 0).replace(/[^0-9]/g, '')) || 0;
+  const kA = parseKm(getKm(a));
+  const kB = parseKm(getKm(b));
+  if (kA && kB && Math.abs(kA - kB) > 100) return false;
+  const pA = getPrice(a), pB = getPrice(b);
+  if (pA && pB && Math.abs(pA - pB) / Math.max(pA, pB) > 0.005) return false;
+  return true;
+}
+
+// ── 2c. Deduplicar lista de candidatos a notificação ──
+// Usado para evitar enviar 2 push do mesmo carro (mesmo carro físico em AS24+MDE).
+// items: array de { r, ... } onde r é o raw flattened.
+// Devolve subset com 1 representante por grupo de duplicados.
+function _deduplicarCrossSource(items) {
+  const out = [];
+  const used = new Set();
+  for (let i = 0; i < items.length; i++) {
+    if (used.has(i)) continue;
+    out.push(items[i]);
+    for (let j = i + 1; j < items.length; j++) {
+      if (used.has(j)) continue;
+      if (_isDupCrossSourceRaw(items[i].r, items[j].r)) used.add(j);
+    }
+  }
+  return out;
+}
+
+// ── 3. Enviar notificações — primeira sync silenciosa, novos, descidas ──
+async function enviarNotificacoes(analysis, freshOriginCount, isFirstSync, newListings, priceDrops) {
+  const { name, ntfyChannel, minMarginPct = 0.05, maxPrice = 0, cachedRef } = analysis;
+  const fmtMlp = (m) => m == null ? '—' : Math.round(m * 100) + '%';
 
   // ── PRIMEIRA SYNC: aprende silenciosamente ──
   if (isFirstSync) {
-    console.log(`  → Primeira sync (aprendizagem): ${freshOrigin.length} anúncios registados`);
+    console.log(`  → Primeira sync (aprendizagem): ${freshOriginCount} anúncios registados`);
     if (ntfyChannel) {
       const refTxt = cachedRef?.priceMedian
         ? `Ref. PT: ${fmtEur(cachedRef.priceMedian)} (${cachedRef.countMatched || 'n/d'} carros)`
         : '⚠ Sem referência PT — margem não vai estar disponível';
-      const msg = `${freshOrigin.length} anúncios registados como ponto de partida.\n\nFiltros activos:\n• Margem mín: ${Math.round(minMarginPct*100)}%\n${maxPrice ? `• Preço máx: ${fmtEur(maxPrice)}\n` : ''}• ${refTxt}\n\nPróxima sync: 12h00`;
+      const msg = `${freshOriginCount} anúncios registados como ponto de partida.\n\nFiltros activos:\n• Margem mín: ${Math.round(minMarginPct*100)}%\n${maxPrice ? `• Preço máx: ${fmtEur(maxPrice)}\n` : ''}• ${refTxt}\n\nPróxima sync: 12h00`;
       await notify(ntfyChannel, `🌱 ${name} (sync iniciada)`, msg, 'default', analysis.id);
     }
-  } else {
-    // ── 🚗 Novos anúncios ──
-    const MAX_NEW = 5;
-    if (newListings.length > 0) {
-      console.log(`  → ${newListings.length} novos anúncios passam filtros`);
+    return;
+  }
 
-      const fmtMlp = (m) => m == null ? '—' : Math.round(m * 100) + '%';
+  // ── 🚗 Novos anúncios — dedup cross-source antes de notificar ──
+  const newDedup = _deduplicarCrossSource(newListings);
+  const dupsSavedNew = newListings.length - newDedup.length;
+  if (dupsSavedNew > 0) {
+    console.log(`  → Dedup cross-source: ${dupsSavedNew} push duplicado(s) evitado(s) (novos)`);
+  }
 
-      if (newListings.length > MAX_NEW) {
-        // RESUMO: muitos novos. Ordena por margem desc (melhores primeiro).
-        const sorted = [...newListings].sort((a, b) => (b.mlPct || 0) - (a.mlPct || 0));
-        const top3 = sorted.slice(0, 3);
-        const valid = sorted.filter(x => x.mlPct != null);
-        const avgMlp = valid.length ? valid.reduce((s, x) => s + x.mlPct, 0) / valid.length : null;
-
-        const top3Lines = top3.map((x, i) => {
-          const price = getPrice(x.r);
-          const km = getKm(x.r);
-          return `${i+1}. ${fmtMlp(x.mlPct)} · ${fmtEur(price)} · ${km || 'n/d'}`;
-        }).join('\n');
-
-        const avgTxt = avgMlp != null ? ` (margem média ${fmtMlp(avgMlp)})` : '';
-        const msg = `Top 3${avgTxt}:\n${top3Lines}\n\n+ ${sorted.length - 3} outros (margem ≥ ${Math.round(minMarginPct*100)}%)\n👉 Tap para ver todos`;
-        await notify(ntfyChannel, `🚗 ${name} (${sorted.length} novos)`, msg, 'high', analysis.id);
-      } else {
-        // POUCOS NOVOS: notificação detalhada por cada
-        // Ordena por margem desc (melhor primeiro)
-        const sorted = [...newListings].sort((a, b) => (b.mlPct || 0) - (a.mlPct || 0));
-        for (const { r, mlPct, calc } of sorted) {
-          const price = getPrice(r);
-          const make = getMake(r);
-          const model = getModel(r);
-          const km = getKm(r);
-
-          // Título: modelo (e ano se disponível)
-          const year = r['firstRegistration'] || r.year || r['vehicle/firstRegistration'] || '';
-          const yearStr = year ? ` ${year}`.slice(0, 5) : '';
-          const title = `🚗 ${make} ${model}${yearStr}`.trim();
-
-          // Linha 1 (subtítulo): margem + preço + valor margem
-          let subtitle;
-          if (mlPct != null && calc) {
-            const marginSign = calc.ml >= 0 ? '+' : '−';
-            subtitle = `${fmtMlp(mlPct)} · ${fmtEur(price)} · ${marginSign}${fmtEur(Math.abs(calc.ml))} margem`;
-          } else {
-            subtitle = `${fmtEur(price)} · ${km || 'km n/d'}`;
-          }
-
-          // Corpo: detalhes
-          let body;
-          if (calc) {
-            body = `${km || 'km n/d'}${yearStr ? ' · ' + year : ''}\nCusto total: ${fmtEur(calc.custo)}\nRef. PT: ${fmtEur(calc.svRef)}\n👉 Tap para abrir`;
-          } else {
-            body = `${km || 'km n/d'}\n${getId(r)}`;
-          }
-
-          await notify(ntfyChannel, title, body, 'high', analysis.id, subtitle, getId(r));
-        }
-      }
+  const MAX_NEW = 5;
+  if (newDedup.length > 0) {
+    console.log(`  → ${newDedup.length} novos anúncios passam filtros`);
+    if (newDedup.length > MAX_NEW) {
+      // RESUMO: muitos novos. Ordena por margem desc (melhores primeiro).
+      const sorted = [...newDedup].sort((a, b) => (b.mlPct || 0) - (a.mlPct || 0));
+      const top3 = sorted.slice(0, 3);
+      const valid = sorted.filter(x => x.mlPct != null);
+      const avgMlp = valid.length ? valid.reduce((s, x) => s + x.mlPct, 0) / valid.length : null;
+      const top3Lines = top3.map((x, i) => {
+        const price = getPrice(x.r);
+        const km = getKm(x.r);
+        return `${i+1}. ${fmtMlp(x.mlPct)} · ${fmtEur(price)} · ${km || 'n/d'}`;
+      }).join('\n');
+      const avgTxt = avgMlp != null ? ` (margem média ${fmtMlp(avgMlp)})` : '';
+      const msg = `Top 3${avgTxt}:\n${top3Lines}\n\n+ ${sorted.length - 3} outros (margem ≥ ${Math.round(minMarginPct*100)}%)\n👉 Tap para ver todos`;
+      await notify(ntfyChannel, `🚗 ${name} (${sorted.length} novos)`, msg, 'high', analysis.id);
     } else {
-      console.log(`  → Sem novos anúncios acima de margem ${Math.round(minMarginPct*100)}%`);
-    }
-
-    // ── 📉 Descidas de preço ──
-    const MAX_DROPS = 3;
-    if (priceDrops.length > 0) {
-      console.log(`  → ${priceDrops.length} descidas de preço`);
-      // Ordena pelas maiores descidas
-      const sortedDrops = [...priceDrops].sort((a, b) => (b.prev.price - b.price) - (a.prev.price - a.price));
-
-      for (const { r, prev, price, mlPct, calc, crossedThreshold } of sortedDrops.slice(0, MAX_DROPS)) {
-        const drop = prev.price - price;
-        const dropPct = Math.round((drop / prev.price) * 100);
-
+      // POUCOS NOVOS: notificação detalhada por cada
+      const sorted = [...newDedup].sort((a, b) => (b.mlPct || 0) - (a.mlPct || 0));
+      for (const { r, mlPct, calc } of sorted) {
+        const price = getPrice(r);
         const make = getMake(r);
         const model = getModel(r);
+        const km = getKm(r);
+        // Título: modelo (e ano se disponível)
         const year = r['firstRegistration'] || r.year || r['vehicle/firstRegistration'] || '';
         const yearStr = year ? ` ${year}`.slice(0, 5) : '';
-
-        const title = `📉 ${make} ${model}${yearStr}`.trim();
-
-        // Subtítulo: descida + margem actual + margem €
-        const fmtMlp = (m) => m == null ? '—' : Math.round(m * 100) + '%';
+        const title = `🚗 ${make} ${model}${yearStr}`.trim();
+        // Linha 1 (subtítulo): margem + preço + valor margem
         let subtitle;
         if (mlPct != null && calc) {
           const marginSign = calc.ml >= 0 ? '+' : '−';
-          subtitle = `−${fmtEur(drop)} · ${fmtMlp(mlPct)} · ${marginSign}${fmtEur(Math.abs(calc.ml))}`;
+          subtitle = `${fmtMlp(mlPct)} · ${fmtEur(price)} · ${marginSign}${fmtEur(Math.abs(calc.ml))} margem`;
         } else {
-          subtitle = `−${fmtEur(drop)} (−${dropPct}%)`;
+          subtitle = `${fmtEur(price)} · ${km || 'km n/d'}`;
         }
-
-        // Body: histórico de preço + detalhes
-        const cross = crossedThreshold ? '\n✓ Agora dentro do filtro' : '';
-        let body = `${fmtEur(prev.price)} → ${fmtEur(price)} (−${dropPct}%)${cross}\n${getKm(r) || 'km n/d'}`;
+        // Corpo: detalhes
+        let body;
         if (calc) {
-          body += `\nCusto: ${fmtEur(calc.custo)} · Ref. PT: ${fmtEur(calc.svRef)}`;
+          body = `${km || 'km n/d'}${yearStr ? ' · ' + year : ''}\nCusto total: ${fmtEur(calc.custo)}\nRef. PT: ${fmtEur(calc.svRef)}\n👉 Tap para abrir`;
+        } else {
+          body = `${km || 'km n/d'}\n${getId(r)}`;
         }
-        body += `\n👉 Tap para abrir`;
-
         await notify(ntfyChannel, title, body, 'high', analysis.id, subtitle, getId(r));
       }
-      if (sortedDrops.length > MAX_DROPS) {
-        await notify(ntfyChannel, `📉 ${name}`, `+ ${sortedDrops.length - MAX_DROPS} outras descidas de preço.\n👉 Tap para ver todas.`, 'low', analysis.id);
-      }
     }
+  } else {
+    console.log(`  → Sem novos anúncios acima de margem ${Math.round(minMarginPct*100)}%`);
   }
 
-  // Incrementa missingCount para anúncios que não apareceram nesta sync
-  // (em vez de prune imediato — tolerância de 2 syncs antes de arquivar)
+  // ── 📉 Descidas de preço — também dedup cross-source ──
+  const dropsDedup = _deduplicarCrossSource(priceDrops);
+  const dupsSavedDrops = priceDrops.length - dropsDedup.length;
+  if (dupsSavedDrops > 0) {
+    console.log(`  → Dedup cross-source: ${dupsSavedDrops} push duplicado(s) evitado(s) (descidas)`);
+  }
+
+  const MAX_DROPS = 3;
+  if (dropsDedup.length > 0) {
+    console.log(`  → ${dropsDedup.length} descidas de preço`);
+    // Ordena pelas maiores descidas
+    const sortedDrops = [...dropsDedup].sort((a, b) => (b.prev.price - b.price) - (a.prev.price - a.price));
+    for (const { r, prev, price, mlPct, calc, crossedThreshold } of sortedDrops.slice(0, MAX_DROPS)) {
+      const drop = prev.price - price;
+      const dropPct = Math.round((drop / prev.price) * 100);
+      const make = getMake(r);
+      const model = getModel(r);
+      const year = r['firstRegistration'] || r.year || r['vehicle/firstRegistration'] || '';
+      const yearStr = year ? ` ${year}`.slice(0, 5) : '';
+      const title = `📉 ${make} ${model}${yearStr}`.trim();
+      // Subtítulo: descida + margem actual + margem €
+      let subtitle;
+      if (mlPct != null && calc) {
+        const marginSign = calc.ml >= 0 ? '+' : '−';
+        subtitle = `−${fmtEur(drop)} · ${fmtMlp(mlPct)} · ${marginSign}${fmtEur(Math.abs(calc.ml))}`;
+      } else {
+        subtitle = `−${fmtEur(drop)} (−${dropPct}%)`;
+      }
+      // Body: histórico de preço + detalhes
+      const cross = crossedThreshold ? '\n✓ Agora dentro do filtro' : '';
+      let body = `${fmtEur(prev.price)} → ${fmtEur(price)} (−${dropPct}%)${cross}\n${getKm(r) || 'km n/d'}`;
+      if (calc) body += `\nCusto: ${fmtEur(calc.custo)} · Ref. PT: ${fmtEur(calc.svRef)}`;
+      body += `\n👉 Tap para abrir`;
+      await notify(ntfyChannel, title, body, 'high', analysis.id, subtitle, getId(r));
+    }
+    if (sortedDrops.length > MAX_DROPS) {
+      await notify(ntfyChannel, `📉 ${name}`, `+ ${sortedDrops.length - MAX_DROPS} outras descidas de preço.\n👉 Tap para ver todas.`, 'low', analysis.id);
+    }
+  }
+}
+
+// ── 4. Arquivar desaparecidos — incrementar missingCount, arquivar após 2 syncs ──
+// (em vez de prune imediato — tolerância de 2 syncs antes de arquivar)
+function arquivarDesaparecidos(knownListings, freshOrigin) {
   const ARCHIVE_THRESHOLD = 2;
   const freshIds = new Set(freshOrigin.map(getId).filter(Boolean));
   const nowIso = new Date().toISOString();
   for (const [id, val] of Object.entries(knownListings)) {
-    if (freshIds.has(id)) continue; // já actualizado no loop acima
+    if (freshIds.has(id)) continue; // já actualizado em classificarListings
     val.missingCount = (val.missingCount || 0) + 1;
     if (val.missingCount >= ARCHIVE_THRESHOLD && !val.archived) {
       val.archived = true;
       val.archivedAt = nowIso;
     }
   }
+}
 
-  // Limite máximo de entradas por análise: 3000 (mais generoso porque agora guardamos raw)
-  // Mantém todos os archived recentes (últimos 30 dias) + activos
+// ── 5. Limpar histórico antigo ──
+// Limite máximo de 3000 entradas. Mantém todos os activos + arquivados < 30 dias.
+function limparHistoricoAntigo(knownListings) {
   const MAX_ENTRIES = 3000;
   const cutoff = Date.now() - 30 * 24 * 60 * 60 * 1000;
   const survivors = Object.entries(knownListings).filter(([_, v]) => {
@@ -528,7 +563,34 @@ async function syncAnalysis(analysis, injectedFreshOrigin) {
     });
     survivors.length = MAX_ENTRIES;
   }
-  analysis.knownListings = Object.fromEntries(survivors);
+  return Object.fromEntries(survivors);
+}
+
+// ── Orquestrador principal ──
+// Filtros suportados: minMarginPct (principal) + maxPrice (segurança extra).
+// Se vier injectedFreshOrigin (ingest manual), salta scrape Apify — útil para testes
+// end-to-end ou re-sincronização a partir de raws descarregados do Apify Console.
+async function syncAnalysis(analysis, injectedFreshOrigin) {
+  const { name, searchUrls, minMarginPct = 0.05, maxPrice = 0 } = analysis;
+  if (!injectedFreshOrigin && !searchUrls?.length) return;
+  const mode = injectedFreshOrigin ? 'INGEST' : 'SCRAPE';
+  console.log(`[${new Date().toISOString()}] Syncing (${mode}): ${name} (minMargin=${Math.round(minMarginPct*100)}% maxPrice=${maxPrice || 'none'})`);
+
+  // 1. Recolher raws
+  const freshOrigin = await recolherAnuncios(analysis, injectedFreshOrigin);
+
+  // 2. Classificar (modifica analysis.knownListings in-place)
+  const { newListings, priceDrops, isFirstSync } = classificarListings(analysis, freshOrigin);
+
+  // 3. Notificar
+  await enviarNotificacoes(analysis, freshOrigin.length, isFirstSync, newListings, priceDrops);
+
+  // 4. Arquivar desaparecidos
+  arquivarDesaparecidos(analysis.knownListings, freshOrigin);
+
+  // 5. Limpar histórico antigo
+  analysis.knownListings = limparHistoricoAntigo(analysis.knownListings);
+
   analysis.lastSync = new Date().toISOString();
 }
 
