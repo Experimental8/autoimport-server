@@ -41,7 +41,7 @@ const APIFY_SV   = 'dadhalfdev/standvirtual-scraper';
 
 // Versão da aplicação — usar formato YYYY-MM-DD-N (incrementar N se vários pushes no mesmo dia)
 // Esta tem que coincidir com APP_VERSION no autoimport_v5.html
-const APP_VERSION = '2026-05-04-6';
+const APP_VERSION = '2026-05-04-8';
 const APP_BUILT_AT = new Date().toISOString();
 
 // Sync SV: refrescar referência PT a cada 2 dias (em ms)
@@ -637,6 +637,13 @@ async function syncAll() {
       console.error(`Error syncing ${a.name}:`, e.message);
     }
   }
+  // Hot-fix 0.2.3: a função notify() faz o seu próprio loadData/saveData para gravar
+  // o histórico de notificações. Como o nosso `data` em memória aqui está desactualizado
+  // em relação a esse campo (a notify escreveu no disco mas a nossa cópia não viu),
+  // o saveData final apagava as notificações guardadas durante o loop.
+  // Solução mínima: relê notifications do disco antes do save final.
+  // Fix arquitectural correcto (passar `data` à notify) fica para 0.3.x.
+  data.notifications = loadData().notifications || [];
   saveData(data);
 }
 
@@ -1078,8 +1085,12 @@ const server = http.createServer(async (req, res) => {
   // Útil para escrever várias entries de uma vez (ex: após processar Fase 2)
   if (req.method === 'POST' && u.pathname === '/specs-cache') {
     try {
-      const body = await readBody(req);
-      const entries = JSON.parse(body || '[]');
+      // readBody já faz JSON.parse — body é o array directamente
+      // Bug histórico (até 2026-05-04-7): havia um JSON.parse redundante aqui que
+      // explodia em todos os requests, devolvendo 400 Bad Request silenciosamente.
+      // Resultado: cache de specs nunca era enviado ao servidor → cada cliente acabava
+      // por re-pagar IA das mesmas chaves em vez de partilhar com outros utilizadores.
+      const entries = await readBody(req);
       if (!Array.isArray(entries)) return err(res, 'Body must be array', 400);
       const data = loadData();
       if (!data.specsCache) data.specsCache = {};
