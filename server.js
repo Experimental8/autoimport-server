@@ -41,7 +41,7 @@ const APIFY_SV   = 'dadhalfdev/standvirtual-scraper';
 
 // Versão da aplicação — usar formato YYYY-MM-DD-N (incrementar N se vários pushes no mesmo dia)
 // Esta tem que coincidir com APP_VERSION no autoimport_v5.html
-const APP_VERSION = '2026-05-04-14';
+const APP_VERSION = '2026-05-04-15';
 const APP_BUILT_AT = new Date().toISOString();
 
 // Sync SV: refrescar referência PT a cada 2 dias (em ms)
@@ -744,6 +744,19 @@ async function syncAnalysis(analysis, injectedFreshOrigin) {
   // 5. Limpar histórico antigo
   analysis.knownListings = limparHistoricoAntigo(analysis.knownListings);
 
+  // 6. Registar entry no histórico de syncs (para card UI)
+  // Mantém apenas últimos 7 dias para evitar bloat. Limpeza no momento da escrita —
+  // mais simples que job separado e suficiente garantia.
+  if (!analysis.syncHistory) analysis.syncHistory = [];
+  analysis.syncHistory.push({
+    ts: new Date().toISOString(),
+    novos: newListings.length,
+    descidas: priceDrops.length,
+    isFirst: isFirstSync,
+  });
+  const cutoff = Date.now() - 7 * 24 * 60 * 60 * 1000;
+  analysis.syncHistory = analysis.syncHistory.filter(e => new Date(e.ts).getTime() > cutoff);
+
   analysis.lastSync = new Date().toISOString();
 }
 
@@ -963,6 +976,20 @@ const server = http.createServer(async (req, res) => {
       lastSyncSV: a.lastSyncSV || null,
       cachedRef: a.cachedRef || null,
       novos, alterados, arquivados,
+    });
+  }
+
+  // GET /analyses/:id/sync-history
+  // Devolve histórico de syncs dos últimos 7 dias para o card UI da plataforma.
+  // O servidor regista cada entry no fim de syncAnalysis e limpa entries > 7 dias.
+  if (req.method === 'GET' && /^\/analyses\/[^/]+\/sync-history$/.test(u.pathname)) {
+    const id = u.pathname.split('/')[2];
+    const data = loadData();
+    const a = (data.analyses || []).find(x => String(x.id) === String(id));
+    if (!a) return err(res, 'analysis not found', 404);
+    return ok(res, {
+      analysisId: a.id,
+      history: a.syncHistory || [],
     });
   }
 
