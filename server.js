@@ -41,7 +41,7 @@ const APIFY_SV   = 'dadhalfdev/standvirtual-scraper';
 
 // Versão da aplicação — usar formato YYYY-MM-DD-N (incrementar N se vários pushes no mesmo dia)
 // Esta tem que coincidir com APP_VERSION no autoimport_v5.html
-const APP_VERSION = '2026-05-04-12';
+const APP_VERSION = '2026-05-04-13';
 const APP_BUILT_AT = new Date().toISOString();
 
 // Sync SV: refrescar referência PT a cada 2 dias (em ms)
@@ -192,7 +192,113 @@ function getFuel(r) {
   return r['vehicle/fuel'] || r.fuel || r['fuelType'] || r['properties/fuelType'] || '';
 }
 
-function calcQuickScore(car, cachedRef) {
+// ── ISV correcto via specsCache (0.2.4) ──────────────────────────────────
+// Bug histórico: ISV_BY_FUEL_SIMPLIFIED usava €5500 fixo gasolina mas BMW M3 paga
+// €19 586 (3.5×). Notificações apareciam com 18% margem quando o cliente real via 3%.
+// Fix: o servidor usa specsCache (que o cliente popula com cilindrada+CO2 da IA) +
+// cilindrada do raw + fórmula AT real para calcular ISV verdadeira. Se não houver
+// dados suficientes, NÃO notifica em vez de notificar com estimativa errada.
+
+function getCC(r) {
+  r = flattenRaw(r);
+  const raw = r.engineSize || r['engineSize'] || r['vehicle/engineSize'] || '';
+  if (!raw) return 0;
+  // Format AS24: "2,993 cc" / MDE pode vir "2993 cm³"
+  const m = String(raw).match(/[\d,.]+/);
+  if (!m) return 0;
+  return Math.round(parseFloat(m[0].replace(/[,.]/g, '')));
+}
+
+function getYear(r) {
+  r = flattenRaw(r);
+  const raw = r.firstRegistration || r.year || r['vehicle/firstRegistration'] || '';
+  if (!raw) return 0;
+  // Formato AS24: "04/2025" — só queremos o ano
+  const m = String(raw).match(/(\d{4})/);
+  return m ? parseInt(m[1]) : 0;
+}
+
+// Normaliza fuel do raw para o vocabulário do specsCache (que segue o do cliente).
+// Cliente normaliza para: 'gasolina', 'gasóleo', 'elétrico', 'híbrido', 'phev', etc.
+function normFuel(raw) {
+  const f = (raw || '').toString().toLowerCase().trim();
+  if (!f) return '';
+  if (f.includes('gasolin') || f === 'petrol' || f.includes('benzin')) return 'gasolina';
+  if (f.includes('diesel') || f.includes('gasóleo') || f.includes('gasoleo')) return 'gasóleo';
+  if (f.includes('electric') || f.includes('elétric') || f.includes('eletric') || f === 'bev') return 'elétrico';
+  if (f.includes('plug') || f.includes('phev')) return 'phev';
+  if (f.includes('hybrid') || f.includes('híbrido') || f.includes('hibrido')) return 'híbrido';
+  return f;
+}
+
+// Fórmula AT real — port directo de calcISV() do cliente (autoimport_v5.html ~linha 2275).
+// Mantém compatibilidade exacta com o que o cliente calcula, para que servidor e cliente
+// concordem sempre sobre carros que estão no specsCache.
+function calcISV_PT(cil, co2, fuel, ano, norma) {
+  const c = (fuel || '').toLowerCase().trim();
+  if (c === 'elétrico' || c === 'eletrico') return 0;
+  const idade = new Date().getFullYear() - (ano || 2020);
+  let cc = cil <= 1000 ? cil * 1.09 - 849.03
+        : cil <= 1250 ? cil * 1.18 - 850.69
+        : cil * 5.61 - 6194.88;
+  cc = Math.max(0, cc);
+  const isD = c === 'gasóleo' || c === 'gasoleo';
+  const isPH = c === 'phev' || c.includes('plug');
+  const n = isPH ? 'WLTP' : (norma || 'WLTP').toUpperCase();
+  // Componentes ambientais (g/km)
+  const agw = g => g <= 110 ? g*.44 - 43.02 : g <= 115 ? g*1.10 - 115.80 : g <= 120 ? g*1.38 - 147.79 : g <= 130 ? g*5.27 - 619.17 : g <= 145 ? g*6.38 - 762.73 : g <= 175 ? g*41.54 - 5819.56 : g <= 195 ? g*51.38 - 7247.39 : g <= 235 ? g*193.01 - 34190.52 : g*233.81 - 41910.96;
+  const agn = g => g <= 99 ? g*4.62 - 427 : g <= 115 ? g*8.09 - 750.99 : g <= 145 ? g*52.56 - 5903.94 : g <= 175 ? g*61.24 - 7140.17 : g <= 195 ? g*155.97 - 23627.27 : g*205.65 - 33390.12;
+  const adw = g => g <= 110 ? g*1.72 - 11.50 : g <= 120 ? g*18.96 - 1906.19 : g <= 140 ? g*65.04 - 7360.85 : g <= 150 ? g*127.40 - 16080.57 : g <= 160 ? g*160.81 - 21176.06 : g <= 170 ? g*221.69 - 29227.38 : g <= 190 ? g*274.08 - 36987.98 : g*282.35 - 38271.32;
+  const adn = g => g <= 79 ? g*5.78 - 439.04 : g <= 95 ? g*23.45 - 1848.58 : g <= 120 ? g*79.22 - 7195.63 : g <= 140 ? g*175.73 - 18924.92 : g <= 160 ? g*195.43 - 21720.92 : g*268.42 - 33447.90;
+  let amb = isD ? (n === 'NEDC' ? adn(co2) : adw(co2)) : (isPH ? agw(co2) : (n === 'NEDC' ? agn(co2) : agw(co2)));
+  let bruto = cc + amb;
+  if (isPH) bruto = Math.max(100, bruto * 0.25);
+  else bruto = Math.max(100, bruto);
+  // Tabela redução por idade (0% novo a 80% após 10 anos)
+  const ds = [0, .10, .20, .28, .35, .43, .52, .60, .65, .70, .75, .80];
+  const desc = idade <= 0 ? 0 : idade <= 10 ? ds[Math.min(idade, 10)] : ds[11];
+  let isv = Math.max(100, Math.round(bruto * (1 - desc)));
+  return isv;
+}
+
+// Procura entradas no specsCache que combinem com o raw. Como o servidor não tem
+// submodelo nem potência (só vêm da IA do cliente), faz lookup por chave parcial
+// e calcula média do CO2 das entradas que combinem. Se o specsCache tiver entradas
+// para "BMW M3 2025 gasolina" com CO2 [232, 235, 238], usa a média (235).
+function lookupSpecsForRaw(raw, specsCache) {
+  if (!specsCache) return null;
+  const make  = (getMake(raw)  || '').toLowerCase().trim();
+  const model = (getModel(raw) || '').toLowerCase().trim();
+  const fuel  = normFuel(getFuel(raw));
+  const year  = getYear(raw);
+  if (!make || !model || !fuel || !year) return null;
+
+  // Chave do cliente: marca|modelo|subFirst|ano|combustivel|pot
+  // Servidor procura com prefixo: marca|modelo|*|ano|combustivel|*
+  // (subFirst e pot variam, vamos fazer match parcial)
+  const matches = [];
+  for (const [key, val] of Object.entries(specsCache)) {
+    const parts = key.split('|');
+    if (parts.length < 5) continue;
+    if (parts[0] === make && parts[1] === model && parseInt(parts[3]) === year && parts[4] === fuel) {
+      if (val && val.co2) matches.push(val);
+    }
+  }
+  if (!matches.length) return null;
+  // Média do CO2 das entradas que combinam
+  const co2Avg = Math.round(matches.reduce((s, v) => s + (v.co2 || 0), 0) / matches.length);
+  // Para cilindrada, preferimos o que vem do raw (mais preciso). Fallback: média do cache.
+  const cilFromRaw = getCC(raw);
+  const cilAvg = Math.round(matches.reduce((s, v) => s + (v.cilindrada || 0), 0) / matches.length);
+  return {
+    co2: co2Avg,
+    cilindrada: cilFromRaw || cilAvg,
+    norma: matches[0].co2_norma || 'WLTP',
+    matchCount: matches.length,
+  };
+}
+
+function calcQuickScore(car, cachedRef, specsCache) {
   if (!cachedRef?.priceMedian) return null;
   const price = getPrice(car);
   if (!price) return null;
@@ -200,13 +306,18 @@ function calcQuickScore(car, cachedRef) {
   const country = getCountry(car);
   const transp = TRANSPORT_BY_COUNTRY[country] || 700;
 
-  const fuel = getFuel(car);
-  let isv = 5500;
-  for (const [k, v] of Object.entries(ISV_BY_FUEL_SIMPLIFIED)) {
-    if (fuel.toString().toLowerCase().includes(k.toLowerCase())) {
-      isv = v;
-      break;
-    }
+  const fuel = normFuel(getFuel(car));
+  let isv;
+
+  if (fuel === 'elétrico') {
+    // Eléctricos: ISV é 0 por lei. Cálculo certo sem precisar de specsCache.
+    isv = 0;
+  } else {
+    // Combustão: tenta lookup no specsCache. Sem dados → não notifica.
+    const specs = lookupSpecsForRaw(car, specsCache);
+    if (!specs) return null;  // Sem dados suficientes — não calcula nem notifica
+    const ano = getYear(car) || 2020;
+    isv = calcISV_PT(specs.cilindrada, specs.co2, fuel, ano, specs.norma);
   }
 
   const custo = price + transp + isv + LEGAL_FIXED;
@@ -216,8 +327,6 @@ function calcQuickScore(car, cachedRef) {
   const ml = mb - ivaM;
   const mp = custo > 0 ? mb / custo : 0;
   const score = Math.min(100, Math.max(0, Math.round(mp * 200)));
-  // Margem líquida em percentagem do custo total — métrica decisiva (substitui score na Fase 2)
-  // mlPct é decimal (0.072 = 7.2%)
   const mlPct = custo > 0 ? ml / custo : 0;
 
   return { score, custo, mb, ml, svRef, transp, isv, mlPct, mlEur: ml };
@@ -321,7 +430,10 @@ async function recolherAnuncios(analysis, injectedFreshOrigin) {
 
 // ── 2. Classificar listings — para cada raw, decidir se é novo, conhecido, ou alterado ──
 // Modifica analysis.knownListings in-place. Devolve { newListings, priceDrops, isFirstSync }.
-function classificarListings(analysis, freshOrigin) {
+// `specsCache` (opcional) é usado pelo calcQuickScore para calcular ISV correcta com base
+// em CO2/cilindrada que o cliente já populou via Fase 2 IA. Sem specsCache, calcQuickScore
+// devolve null para combustão (não notifica) e ISV=0 só para eléctricos.
+function classificarListings(analysis, freshOrigin, specsCache) {
   const { minMarginPct = 0.05, maxPrice = 0, cachedRef } = analysis;
   // Modo aprendizagem: primeira sync nunca notifica, só regista
   const isFirstSync = !analysis.lastSync;
@@ -329,6 +441,8 @@ function classificarListings(analysis, freshOrigin) {
   const knownListings = analysis.knownListings;
   const newListings = [];
   const priceDrops = [];
+  // Contadores de diagnóstico (logs após loop)
+  let skippedNoSpecs = 0;
 
   // Avalia cada anúncio: calcula margem + verifica filtros
   const evaluate = (r) => {
@@ -339,8 +453,15 @@ function classificarListings(analysis, freshOrigin) {
       return { passes: false, reason: 'over-maxPrice', mlPct: null, calc: null };
     }
     // Margem (precisa cachedRef). Sem cachedRef: notifica tudo (não consegue decidir).
-    const calc = cachedRef ? calcQuickScore(r, cachedRef) : null;
+    // Com cachedRef mas sem specs no cache: calcQuickScore devolve null para combustão
+    // → não notifica (decisão do utilizador: melhor sem notificação que falsa).
+    const calc = cachedRef ? calcQuickScore(r, cachedRef, specsCache) : null;
     const mlPct = calc?.mlPct ?? null;
+    // Se calc é null para combustão (sem specs), não passa
+    if (cachedRef && !calc && normFuel(getFuel(r)) !== 'elétrico') {
+      skippedNoSpecs++;
+      return { passes: false, reason: 'no-specs-cache', mlPct: null, calc: null };
+    }
     const passes = mlPct == null ? true : mlPct >= minMarginPct;
     return { passes, mlPct, calc };
   };
@@ -395,7 +516,7 @@ function classificarListings(analysis, freshOrigin) {
       };
     }
   }
-  return { newListings, priceDrops, isFirstSync };
+  return { newListings, priceDrops, isFirstSync, skippedNoSpecs };
 }
 
 // ── 2b. Detectar duplicado cross-source em raws ──
@@ -491,22 +612,19 @@ async function enviarNotificacoes(analysis, freshOriginCount, isFirstSync, newLi
         const make = getMake(r);
         const model = getModel(r);
         const km = getKm(r);
-        // Título: modelo (e ano se disponível)
+        // Título: modelo (e ano se disponível) + sufixo "oportunidade"
         const year = r['firstRegistration'] || r.year || r['vehicle/firstRegistration'] || '';
         const yearStr = year ? ` ${year}`.slice(0, 5) : '';
-        const title = `🚗 ${make} ${model}${yearStr}`.trim();
-        // Linha 1 (subtítulo): margem + preço + valor margem
-        let subtitle;
-        if (mlPct != null && calc) {
-          const marginSign = calc.ml >= 0 ? '+' : '−';
-          subtitle = `${fmtMlp(mlPct)} · ${fmtEur(price)} · ${marginSign}${fmtEur(Math.abs(calc.ml))} margem`;
-        } else {
-          subtitle = `${fmtEur(price)} · ${km || 'km n/d'}`;
-        }
-        // Corpo: detalhes
+        const title = `🚗 ${make} ${model}${yearStr} — oportunidade`.trim();
+        // Subtítulo: só preço (mais honesto — margem é estimativa frágil)
+        const subtitle = `${fmtEur(price)}`;
+        // Corpo: km/ano + custo estimado + ref PT + aviso ISV
         let body;
         if (calc) {
-          body = `${km || 'km n/d'}${yearStr ? ' · ' + year : ''}\nCusto total: ${fmtEur(calc.custo)}\nRef. PT: ${fmtEur(calc.svRef)}\n👉 Tap para abrir`;
+          // Eléctricos: ISV é exacta (=0), não dizer "estimada"
+          const fuel = normFuel(getFuel(r));
+          const isvNote = fuel === 'elétrico' ? '' : '\n⚠ ISV estimada';
+          body = `${km || 'km n/d'}${yearStr ? ' · ' + year : ''}\nCusto estimado: ~${fmtEur(calc.custo)}\nRef. PT: ${fmtEur(calc.svRef)}${isvNote}\n👉 Tap para confirmar`;
         } else {
           body = `${km || 'km n/d'}\n${getId(r)}`;
         }
@@ -610,7 +728,12 @@ async function syncAnalysis(analysis, injectedFreshOrigin) {
   const freshOrigin = await recolherAnuncios(analysis, injectedFreshOrigin);
 
   // 2. Classificar (modifica analysis.knownListings in-place)
-  const { newListings, priceDrops, isFirstSync } = classificarListings(analysis, freshOrigin);
+  // Carrega specsCache do disco para calcular ISV real via cilindrada+CO2 que o cliente já viu
+  const specsCache = (loadData().specsCache) || {};
+  const { newListings, priceDrops, isFirstSync, skippedNoSpecs } = classificarListings(analysis, freshOrigin, specsCache);
+  if (skippedNoSpecs > 0) {
+    console.log(`  → ${skippedNoSpecs} carro(s) de combustão saltados (specsCache não tem dados — será notificado quando o cliente integrar)`);
+  }
 
   // 3. Notificar
   await enviarNotificacoes(analysis, freshOrigin.length, isFirstSync, newListings, priceDrops);
