@@ -45,9 +45,9 @@ const APP_VERSION = '2026-05-14-8';
 const APP_BUILT_AT = new Date().toISOString();
 
 // Modelo de IA usado pelo endpoint /co2-suggest (extensão autoimport.app).
-// String conhecida e válida na API. Se a plataforma B2B usar outro/mais
-// recente, mudar APENAS esta linha.
-const CO2_MODEL = 'claude-sonnet-4-20250514';
+// Sonnet 4.6 — atual e ativo (o claude-sonnet-4-20250514 foi reformado pela
+// Anthropic em 2026-04-20, daí dar 404). Se a B2B usar outro, mudar só esta linha.
+const CO2_MODEL = 'claude-sonnet-4-6';
 
 // Sync SV: refrescar referência PT a cada 2 dias (em ms)
 const SV_SYNC_INTERVAL_MS = 2 * 24 * 60 * 60 * 1000;
