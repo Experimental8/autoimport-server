@@ -41,8 +41,13 @@ const APIFY_SV   = 'dadhalfdev/standvirtual-scraper';
 
 // Versão da aplicação — usar formato YYYY-MM-DD-N (incrementar N se vários pushes no mesmo dia)
 // Esta tem que coincidir com APP_VERSION no autoimport_v5.html
-const APP_VERSION = '2026-05-04-15';
+const APP_VERSION = '2026-05-14-8';
 const APP_BUILT_AT = new Date().toISOString();
+
+// Modelo de IA usado pelo endpoint /co2-suggest (extensão autoimport.app).
+// String conhecida e válida na API. Se a plataforma B2B usar outro/mais
+// recente, mudar APENAS esta linha.
+const CO2_MODEL = 'claude-sonnet-4-20250514';
 
 // Sync SV: refrescar referência PT a cada 2 dias (em ms)
 const SV_SYNC_INTERVAL_MS = 2 * 24 * 60 * 60 * 1000;
@@ -1274,6 +1279,143 @@ const server = http.createServer(async (req, res) => {
     data.specsCache = {};
     saveData(data);
     return ok(res, { ok: true, removed: before });
+  }
+
+  // POST /co2-suggest — sugere CO2 para a extensão autoimport.app.
+  // Body: { marca, modelo, submodelo, ano, combustivel, potencia, cilindrada, norma_euro }
+  // 1) Cache-first (mesmo matching da B2B → consistência total, custo zero)
+  // 2) Cache-miss → IA (Anthropic), 3) guarda de volta na cache partilhada.
+  if (req.method === 'POST' && u.pathname === '/co2-suggest') {
+    try {
+      const b = await readBody(req);
+      const marca = (b.marca || '').toString().trim();
+      const modelo = (b.modelo || '').toString().trim();
+      const ano = parseInt(b.ano) || 0;
+      const fuelNorm = normFuel(b.combustivel);
+      if (!marca || !modelo || !ano || !fuelNorm) {
+        return err(res, 'marca, modelo, ano e combustivel são obrigatórios');
+      }
+
+      // 1) Cache-first — reutiliza lookupSpecsForRaw (igual à plataforma B2B)
+      const specsCache = (loadData().specsCache) || {};
+      const pseudoRaw = { make: marca, model: modelo, fuel: fuelNorm, year: ano, engineSize: b.cilindrada || 0 };
+      const hit = lookupSpecsForRaw(pseudoRaw, specsCache);
+      if (hit && hit.co2) {
+        return ok(res, { co2: hit.co2, norma: hit.norma, confianca: 'cache', fonte: 'cache', matchCount: hit.matchCount });
+      }
+
+      // 2) Cache-miss → Brave (ancorar) + IA
+      const apiKey = process.env.ANTHROPIC_API_KEY;
+      if (!apiKey) return err(res, 'ANTHROPIC_API_KEY não configurada no servidor', 500);
+
+      const desc = [marca, modelo, b.submodelo, ano, fuelNorm,
+        b.potencia ? ('potência ' + b.potencia) : '',
+        b.cilindrada ? (b.cilindrada + ' cm3') : '',
+        b.norma_euro ? ('norma ' + b.norma_euro) : ''
+      ].filter(Boolean).join(' ');
+
+      // 2a) Pesquisa Brave para ancorar a resposta em dados reais (como a B2B).
+      //     Degradação suave: se a chave Brave faltar ou falhar, segue só com IA.
+      let contextoWeb = '';
+      const braveKey = process.env.BRAVE_API_KEY;
+      if (braveKey) {
+        const queries = [
+          desc + ' CO2 emissions g/km',
+          marca + ' ' + modelo + ' ' + (b.submodelo || '') + ' ' + ano + ' emissões CO2 WLTP',
+          marca + ' ' + modelo + ' ' + ano + ' ' + fuelNorm + ' technical data CO2'
+        ];
+        const trechos = [];
+        for (const q of queries) {
+          try {
+            const bUrl = 'https://api.search.brave.com/res/v1/web/search?q=' + encodeURIComponent(q) + '&count=3';
+            const bResp = await fetch(bUrl, { headers: { 'Accept': 'application/json', 'X-Subscription-Token': braveKey } });
+            if (!bResp.ok) continue;
+            const bData = await bResp.json();
+            const results = (bData && bData.web && bData.web.results) || [];
+            results.forEach(r => {
+              const t = ((r.title || '') + ' — ' + (r.description || '')).replace(/\s+/g, ' ').trim();
+              if (t) trechos.push(t.slice(0, 300));
+            });
+          } catch (e) { /* query falhada → ignorar e continuar */ }
+        }
+        if (trechos.length) {
+          contextoWeb = '\n\nResultados de pesquisa web (usa-os como fonte principal):\n- '
+            + trechos.slice(0, 12).join('\n- ');
+        }
+      }
+
+      const prompt = 'És um especialista em homologação automóvel europeia. '
+        + 'Indica o valor de emissões de CO2 (g/km) de homologação mais provável para este veículo. '
+        + 'Veículo: ' + desc + '.'
+        + contextoWeb
+        + (contextoWeb
+            ? ' Baseia-te sobretudo nos resultados de pesquisa acima; usa conhecimento geral só se forem insuficientes. '
+            : ' ')
+        + 'Responde APENAS com JSON, sem texto antes nem depois, no formato exacto: '
+        + '{"co2": <número g/km>, "norma": "WLTP" ou "NEDC", "confianca": "alta" ou "média" ou "baixa", "nota": "<frase curta>"}. '
+        + 'Se não tiveres dados para uma estimativa fiável, devolve co2 igual a 0 e confianca "baixa".';
+
+      const aiResp = await fetch('https://api.anthropic.com/v1/messages', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'x-api-key': apiKey,
+          'anthropic-version': '2023-06-01'
+        },
+        body: JSON.stringify({
+          model: CO2_MODEL,
+          max_tokens: 300,
+          messages: [{ role: 'user', content: prompt }]
+        })
+      });
+      if (!aiResp.ok) {
+        const t = await aiResp.text();
+        return err(res, 'IA ' + aiResp.status + ': ' + t.slice(0, 200), 502);
+      }
+      const aiData = await aiResp.json();
+      let txt = '';
+      if (Array.isArray(aiData.content)) {
+        txt = aiData.content.filter(c => c.type === 'text').map(c => c.text).join('');
+      }
+      let parsed;
+      try {
+        const m = txt.match(/\{[\s\S]*\}/);
+        parsed = JSON.parse(m ? m[0] : txt);
+      } catch (e) {
+        return err(res, 'Resposta da IA ilegível', 502);
+      }
+      const co2 = parseInt(parsed.co2) || 0;
+      const norma = (parsed.norma === 'NEDC') ? 'NEDC' : 'WLTP';
+      const confianca = ['alta', 'média', 'baixa'].includes(parsed.confianca) ? parsed.confianca : 'baixa';
+      const nota = (parsed.nota || '').toString().slice(0, 200);
+
+      // 3) Guardar de volta na cache partilhada (grátis na próxima; ajuda a B2B).
+      //    Chave no mesmo formato do cliente B2B: marca|modelo|subFirst|ano|fuel|pot
+      if (co2 > 0) {
+        const subFirst = ((b.submodelo || '').toString().trim().split(/\s+/)[0] || '').toLowerCase();
+        const potBucket = b.potencia ? String(Math.round((parseInt(b.potencia) || 0) / 10) * 10) : '0';
+        const key = [marca.toLowerCase(), modelo.toLowerCase(), subFirst, ano, fuelNorm, potBucket].join('|');
+        const data = loadData();
+        if (!data.specsCache) data.specsCache = {};
+        data.specsCache[key] = {
+          co2: co2,
+          cilindrada: parseInt(b.cilindrada) || 0,
+          co2_norma: norma,
+          co2_conf: confianca,
+          ts: Date.now()
+        };
+        const keys = Object.keys(data.specsCache);
+        if (keys.length > 1000) {
+          const sorted = keys.sort((a, b2) => (data.specsCache[a].ts || 0) - (data.specsCache[b2].ts || 0));
+          sorted.slice(0, keys.length - 1000).forEach(k => delete data.specsCache[k]);
+        }
+        saveData(data);
+      }
+
+      return ok(res, { co2: co2, norma: norma, confianca: confianca, nota: nota, fonte: 'ia' });
+    } catch (e) {
+      return err(res, e.message, 500);
+    }
   }
 
   err(res, 'Not found', 404);
