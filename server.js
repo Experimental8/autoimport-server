@@ -1363,12 +1363,30 @@ const server = http.createServer(async (req, res) => {
       let contextoWeb = '';
       const braveKey = process.env.BRAVE_API_KEY;
       const trechos = [];
+
+      // Fuel em inglês para queries de sites internacionais (carfolio,
+      // automobile-catalog, evdatabase usam "diesel"/"petrol", não "gasóleo").
+      // PHEV/híbrido/elétrico ficam iguais (são palavras comuns em todas línguas).
+      const fuelEN = fuelNorm === 'gasóleo' ? 'diesel'
+                   : fuelNorm === 'gasolina' ? 'petrol'
+                   : fuelNorm;
+      // Protocolo provável conforme regra UE (WLTP obrigatório desde 09/2018).
+      // Carros 2018 ficam ambíguos: query genérica em vez de forçar protocolo.
+      const protocoloProvavel = ano >= 2019 ? 'WLTP' : (ano <= 2017 ? 'NEDC' : '');
+
       if (braveKey) {
         const queries = [
           desc + ' CO2 emissions g/km',
-          marca + ' ' + modelo + ' ' + (b.submodelo || '') + ' ' + ano + ' emissões CO2 WLTP',
-          marca + ' ' + modelo + ' ' + ano + ' ' + fuelNorm + ' technical data CO2'
+          marca + ' ' + modelo + ' ' + (b.submodelo || '') + ' ' + ano + ' ' + fuelEN + ' CO2 specifications',
+          protocoloProvavel
+            ? marca + ' ' + modelo + ' ' + ano + ' ' + fuelEN + ' ' + protocoloProvavel + ' CO2'
+            : marca + ' ' + modelo + ' ' + ano + ' ' + fuelEN + ' technical data CO2'
         ];
+        // Para PHEV o CO2 "ponderado" é diferente do CO2 a gasolina puro;
+        // query específica encontra trechos com weighted/combined.
+        if (fuelNorm === 'phev') {
+          queries.push(marca + ' ' + modelo + ' ' + ano + ' plug-in hybrid weighted CO2 electric range km');
+        }
         for (const q of queries) {
           for (let tentativa = 1; tentativa <= 3; tentativa++) {
             try {
@@ -1402,16 +1420,24 @@ const server = http.createServer(async (req, res) => {
       }
       contextoWeb = '\n\nResultados de pesquisa web (ÚNICA fonte permitida):\n- '
         + trechos.slice(0, 12).join('\n- ');
+      console.log('[co2-suggest]', marca, modelo, ano, fuelNorm,
+                  b.pais_vendedor ? '('+b.pais_vendedor+')' : '',
+                  '→ trechos:', trechos.length);
+
+      // Mercado: ajuda a desambiguar versões nacionais (ex.: BMW 218 versão
+      // IT vs DE pode ter CO2 ligeiramente diferente). Vazio se não enviado.
+      const mercado = b.pais_vendedor ? (' (mercado ' + b.pais_vendedor + ')') : '';
 
       const prompt = 'És um especialista em homologação automóvel europeia. '
         + 'Indica o valor de emissões de CO2 (g/km) de homologação mais provável para este veículo'
         + (precisaAutonomia
             ? ', e a autonomia elétrica oficial em modo elétrico (km). '
             : '. ')
-        + 'Veículo: ' + desc + '.'
+        + 'Veículo: ' + desc + mercado + '.'
         + contextoWeb
         + ' Baseia-te EXCLUSIVAMENTE nos resultados de pesquisa acima. '
         + 'NÃO uses conhecimento geral nem adivinhes: se os resultados não permitirem uma estimativa fiável, devolve 0 e confianca "baixa". '
+        + 'Norma de homologação: carros matriculados em 2019 ou mais recente são WLTP; em 2017 ou anterior são NEDC; 2018 é zona de transição (escolhe conforme indicado nos resultados). '
         + 'Responde APENAS com JSON, sem texto antes nem depois, no formato exacto: '
         + '{"co2": <número g/km>, "autonomia": <autonomia elétrica em km, ou 0 se não aplicável/desconhecida>, "norma": "WLTP" ou "NEDC", "confianca": "alta" ou "média" ou "baixa", "nota": "<frase curta>"}.';
 
