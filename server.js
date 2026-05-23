@@ -41,7 +41,7 @@ const APIFY_SV   = 'dadhalfdev/standvirtual-scraper';
 
 // Versão da aplicação — usar formato YYYY-MM-DD-N (incrementar N se vários pushes no mesmo dia)
 // Esta tem que coincidir com APP_VERSION no autoimport_v5.html
-const APP_VERSION = '2026-05-14-8';
+const APP_VERSION = '2026-05-23-1';
 const APP_BUILT_AT = new Date().toISOString();
 
 // Modelo de IA usado pelo endpoint /co2-suggest (extensão autoimport.app).
@@ -54,9 +54,14 @@ const SV_SYNC_INTERVAL_MS = 2 * 24 * 60 * 60 * 1000;
 
 // ── Persistence ───────────────────────────────────────────────────────────
 function loadData() {
-  if (!fs.existsSync(DATA_FILE)) return { analyses: [], notifications: [] };
-  try { return JSON.parse(fs.readFileSync(DATA_FILE, 'utf8')); }
-  catch { return { analyses: [], notifications: [] }; }
+  if (!fs.existsSync(DATA_FILE)) return { analyses: [], notifications: [], sv_analyses: {} };
+  try {
+    const d = JSON.parse(fs.readFileSync(DATA_FILE, 'utf8'));
+    // Migração suave: ficheiros antigos não têm sv_analyses
+    if (!d.sv_analyses) d.sv_analyses = {};
+    return d;
+  }
+  catch { return { analyses: [], notifications: [], sv_analyses: {} }; }
 }
 function saveData(data) { fs.writeFileSync(DATA_FILE, JSON.stringify(data, null, 2)); }
 
@@ -1517,6 +1522,159 @@ const server = http.createServer(async (req, res) => {
       return ok(res, { co2: co2, norma: norma, autonomia: autonomia, confianca: confianca, nota: nota, fonte: 'ia' });
     } catch (e) {
       return err(res, e.message, 500);
+    }
+  }
+
+  // ============================================================
+  // StandVirtual — pool partilhada de mercado nacional
+  // ============================================================
+  // Pool partilhada entre todos os utilizadores da extensão. Análises
+  // identificadas pela search_key (URL canónica da pesquisa SV). Sem
+  // autenticação por agora — segue o padrão dos outros endpoints.
+  // Cada anúncio guarda first_seen/last_seen + status active|retired.
+  // Quando uma análise é marcada concluída (chega à última página),
+  // anúncios não vistos desde a última conclusão passam a "retired"
+  // com retired_at registado, para preservar histórico para futuras
+  // estatísticas sem influenciar a mediana actual.
+  // ============================================================
+
+  if (req.method === 'POST' && u.pathname === '/sv-analyses') {
+    try {
+      const body = await readBody(req);
+      if (!body || !body.search_key) {
+        return err(res, 'search_key é obrigatório', 400);
+      }
+      const data = loadData();
+      const now = Date.now();
+      const key = String(body.search_key);
+
+      let analise = data.sv_analyses[key];
+      if (!analise) {
+        analise = {
+          search_key: key,
+          search_label: body.search_label || key,
+          pages_visited: [],
+          concluida: false,
+          created_at: now,
+          last_updated: now,
+          last_completed: null,
+          ads: {}
+        };
+      }
+
+      // Actualizar label se vier (heurística do cliente pode evoluir)
+      if (body.search_label) analise.search_label = String(body.search_label);
+
+      // Merge pages_visited (union, ordenado)
+      if (Array.isArray(body.pages_visited)) {
+        const set = new Set(analise.pages_visited || []);
+        body.pages_visited.forEach(p => {
+          const n = parseInt(p, 10);
+          if (n > 0) set.add(n);
+        });
+        analise.pages_visited = Array.from(set).sort((a, b) => a - b);
+      }
+
+      // Merge ads — dedup pelo data-id, actualizar preços, reactivar retirados
+      if (body.ads && typeof body.ads === 'object') {
+        for (const id of Object.keys(body.ads)) {
+          const novo = body.ads[id];
+          if (!novo || typeof novo !== 'object') continue;
+          const existente = analise.ads[id];
+          if (existente) {
+            if (typeof novo.preco === 'number' && novo.preco > 0) existente.preco = novo.preco;
+            if (typeof novo.km === 'number' && novo.km >= 0) existente.km = novo.km;
+            if (typeof novo.ano === 'number' && novo.ano > 0) existente.ano = novo.ano;
+            if (typeof novo.url === 'string' && novo.url) existente.url = novo.url;
+            existente.last_seen = now;
+            // Anúncio retirado que reapareceu: volta a active
+            if (existente.status === 'retired') {
+              existente.status = 'active';
+              existente.retired_at = null;
+            }
+          } else {
+            analise.ads[id] = {
+              preco: typeof novo.preco === 'number' ? novo.preco : 0,
+              km: typeof novo.km === 'number' ? novo.km : 0,
+              ano: typeof novo.ano === 'number' ? novo.ano : 0,
+              url: typeof novo.url === 'string' ? novo.url : '',
+              first_seen: now,
+              last_seen: now,
+              status: 'active',
+              retired_at: null
+            };
+          }
+        }
+      }
+
+      // Marcar concluída + detectar retirados
+      if (body.concluida === true) {
+        analise.concluida = true;
+        // Só detectamos retirados a partir da 2ª conclusão. Na primeira,
+        // last_completed é null — usamos esta como "baseline" sem comparar.
+        // Comparamos com <= porque anúncios vistos no momento exacto da
+        // última conclusão têm last_seen === last_completed.
+        if (analise.last_completed) {
+          const referencia = analise.last_completed;
+          for (const id of Object.keys(analise.ads)) {
+            const ad = analise.ads[id];
+            if (ad.status === 'active' && ad.last_seen <= referencia) {
+              ad.status = 'retired';
+              ad.retired_at = now;
+            }
+          }
+        }
+        analise.last_completed = now;
+      } else if (body.concluida === false) {
+        analise.concluida = false;
+      }
+
+      analise.last_updated = now;
+      data.sv_analyses[key] = analise;
+      saveData(data);
+      return ok(res, analise);
+    } catch (e) {
+      return err(res, 'POST /sv-analyses: ' + e.message, 500);
+    }
+  }
+
+  if (req.method === 'GET' && u.pathname === '/sv-analyses') {
+    try {
+      const data = loadData();
+      const searchKey = u.searchParams.get('search_key');
+      if (searchKey) {
+        // Detalhe de uma análise
+        const a = data.sv_analyses[searchKey];
+        if (!a) return ok(res, null);
+        return ok(res, a);
+      }
+      // Lista — só metadados (sem ads, para ser leve)
+      const lista = Object.values(data.sv_analyses).map(a => {
+        const ads = a.ads || {};
+        const ids = Object.keys(ads);
+        let active = 0, retired = 0;
+        for (let i = 0; i < ids.length; i++) {
+          if (ads[ids[i]].status === 'retired') retired++;
+          else active++;
+        }
+        return {
+          search_key: a.search_key,
+          search_label: a.search_label,
+          pages_visited: a.pages_visited,
+          concluida: a.concluida,
+          ad_count: ids.length,
+          ad_count_active: active,
+          ad_count_retired: retired,
+          created_at: a.created_at,
+          last_updated: a.last_updated,
+          last_completed: a.last_completed
+        };
+      });
+      // Ordenar por mais recente primeiro
+      lista.sort((x, y) => (y.last_updated || 0) - (x.last_updated || 0));
+      return ok(res, lista);
+    } catch (e) {
+      return err(res, 'GET /sv-analyses: ' + e.message, 500);
     }
   }
 
