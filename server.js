@@ -838,6 +838,42 @@ function readBody(req) {
 function ok(res, data)       { res.writeHead(200); res.end(JSON.stringify(data)); }
 function err(res, msg, c=400){ res.writeHead(c);   res.end(JSON.stringify({ error: msg })); }
 
+// Tokeniza uma string em Set de tokens normalizados (lowercase, sem acentos,
+// só alfanuméricos, length >= 2, sem stopwords PT + automotive + technical).
+// Usado pelo endpoint /sv-analyses/lookup para fazer match fuzzy entre
+// marca/modelo/submodelo (do MB.de/AS24) e search_key/search_label das
+// análises SV armazenadas.
+const TOKEN_STOPWORDS = new Set([
+  // Stopwords PT comuns
+  'a', 'o', 'de', 'da', 'do', 'em', 'na', 'no', 'com', 'sem', 'para',
+  // SV URL conventions
+  'carros', 'q', 'todos', 'anuncio',
+  // SV query params (filter_enum_make=porsche dá ruído se tokenizado)
+  'search', 'filter', 'enum', 'float', 'from', 'to',
+  'make', 'model', 'year', 'price', 'mileage', 'km',
+  // Combustível (varia entre sites — ignorar no match)
+  'gasolina', 'diesel', 'gasoleo', 'hibrido', 'plug', 'in',
+  'phev', 'bev', 'ev', 'hev', 'mhev', 'eletrico', 'electric',
+  // Transmissão (varia entre sites — ignorar no match)
+  'auto', 'manual', 'automatica', 'automatic', 'caixa', 'transmissao',
+  // Categorias estruturais do fabricante usadas em URLs do SV mas que
+  // raramente aparecem nos campos marca/modelo do MB.de/AS24:
+  //   Porsche /carros/porsche/911/...   ← 911 é modelo, sem categoria
+  //   BMW    /carros/bmw/serie-3/320d   ← "serie-3" é categoria, 320d é modelo
+  //   Merc.  /carros/mercedes-benz/classe-c/c-220 ← "classe-c" é categoria
+  // Sem estes stopwords, BMW/Mercedes ficariam abaixo do threshold de 80%.
+  'serie', 'series', 'classe', 'class'
+]);
+function tokenizar(s) {
+  if (!s || typeof s !== 'string') return new Set();
+  return new Set(
+    s.toLowerCase()
+      .normalize('NFD').replace(/[\u0300-\u036f]/g, '')  // remover acentos
+      .split(/[^a-z0-9]+/)
+      .filter(t => t.length >= 2 && !TOKEN_STOPWORDS.has(t))
+  );
+}
+
 // ── HTTP Server ───────────────────────────────────────────────────────────
 const server = http.createServer(async (req, res) => {
   res.setHeader('Access-Control-Allow-Origin', '*');
@@ -1635,6 +1671,95 @@ const server = http.createServer(async (req, res) => {
       return ok(res, analise);
     } catch (e) {
       return err(res, 'POST /sv-analyses: ' + e.message, 500);
+    }
+  }
+
+  // Cross-site lookup: cliente em MB.de/AS24 manda marca+modelo+submodelo
+  // do anúncio actual; servidor devolve a análise SV mais relevante (se
+  // houver match >= 80%) para popular automaticamente a secção "mercado PT"
+  // no card de cálculo, sem o utilizador ter de afixar manualmente.
+  //
+  // Regras:
+  //  - marca e modelo são obrigatórios (pelo menos 1 token cada)
+  //  - filtra análises com < 3 anúncios activos (estatística não-fiável)
+  //  - score = (tokens da análise que existem no input do cliente) / (tokens da análise)
+  //    → análises mais específicas que o cliente pediu são penalizadas
+  //  - threshold de 80% para devolver match
+  //  - desempate: mais anúncios activos, depois mais recente
+  if (req.method === 'GET' && u.pathname === '/sv-analyses/lookup') {
+    try {
+      const tokensMarca = tokenizar(u.searchParams.get('marca') || '');
+      const tokensModelo = tokenizar(u.searchParams.get('modelo') || '');
+      const tokensSub = tokenizar(u.searchParams.get('submodelo') || '');
+
+      if (tokensMarca.size === 0 || tokensModelo.size === 0) {
+        return ok(res, null);
+      }
+
+      // União de tokens do cliente (para calcular o score)
+      const tokensCliente = new Set([...tokensMarca, ...tokensModelo, ...tokensSub]);
+
+      const data = loadData();
+      const candidatos = [];
+
+      for (const k of Object.keys(data.sv_analyses || {})) {
+        const a = data.sv_analyses[k];
+        if (!a) continue;
+
+        // Contar anúncios activos (status === 'active' ou sem status)
+        const ads = a.ads || {};
+        let nActive = 0;
+        for (const id of Object.keys(ads)) {
+          if (!ads[id].status || ads[id].status === 'active') nActive++;
+        }
+        if (nActive < 3) continue;
+
+        // Tokens da análise (search_key + search_label) — o tokenizar já
+        // remove stopwords técnicas como 'filter', 'enum', 'search', etc.
+        const tokensAnalise = tokenizar(
+          (a.search_key || '') + ' ' + (a.search_label || '')
+        );
+        if (tokensAnalise.size === 0) continue;
+
+        // Marca obrigatória: pelo menos um token da marca tem de existir
+        let temMarca = false;
+        for (const t of tokensMarca) {
+          if (tokensAnalise.has(t)) { temMarca = true; break; }
+        }
+        if (!temMarca) continue;
+
+        // Modelo obrigatório: pelo menos um token do modelo tem de existir
+        let temModelo = false;
+        for (const t of tokensModelo) {
+          if (tokensAnalise.has(t)) { temModelo = true; break; }
+        }
+        if (!temModelo) continue;
+
+        // Score = % de tokens da análise que estão no cliente
+        // (penaliza análises mais específicas do que o que o cliente pediu)
+        let matches = 0;
+        for (const t of tokensAnalise) {
+          if (tokensCliente.has(t)) matches++;
+        }
+        const score = matches / tokensAnalise.size;
+
+        if (score >= 0.8) {
+          candidatos.push({ analise: a, score: score, nActive: nActive });
+        }
+      }
+
+      if (candidatos.length === 0) return ok(res, null);
+
+      // Ordenar: maior score, mais activos, mais recente
+      candidatos.sort((x, y) => {
+        if (y.score !== x.score) return y.score - x.score;
+        if (y.nActive !== x.nActive) return y.nActive - x.nActive;
+        return (y.analise.last_updated || 0) - (x.analise.last_updated || 0);
+      });
+
+      return ok(res, candidatos[0].analise);
+    } catch (e) {
+      return err(res, 'GET /sv-analyses/lookup: ' + e.message, 500);
     }
   }
 
