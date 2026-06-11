@@ -1166,6 +1166,46 @@ const server = http.createServer(async (req, res) => {
     }
   }
 
+  // POST /bug-report { assunto, corpo } — relatório de bug da extensão Carscore.
+  // O popup (modal de bug, desde v0.25.0) monta o assunto e o corpo em texto
+  // simples e envia-os aqui; este endpoint reencaminha-os por email para
+  // geral@carscore.pt via Resend. A UI do popup trata 200 como "enviado"; em
+  // qualquer outro código de erro recorre ao plano B (copiar para a área de
+  // transferência). Por isso devolvemos 200 só quando o email saiu mesmo.
+  if (req.method === 'POST' && u.pathname === '/bug-report') {
+    try {
+      const body = await readBody(req);
+      const assunto = (body.assunto || '').trim();
+      const corpo   = (body.corpo   || '').trim();
+      if (!assunto || !corpo) return err(res, 'assunto e corpo obrigatórios');
+
+      const resendKey = process.env.RESEND_API_KEY;
+      if (!resendKey) return err(res, 'RESEND_API_KEY não configurada no servidor', 500);
+
+      // O remetente tem de pertencer a um domínio verificado no Resend (DKIM/SPF
+      // configurados em carscore.pt). Ambos configuráveis por env para não ter
+      // de mexer no código se o endereço mudar.
+      const from = process.env.BUG_REPORT_FROM || 'Carscore <bug@carscore.pt>';
+      const to   = process.env.BUG_REPORT_TO   || 'geral@carscore.pt';
+
+      const resp = await fetch('https://api.resend.com/emails', {
+        method: 'POST',
+        headers: {
+          'Authorization': 'Bearer ' + resendKey,
+          'Content-Type': 'application/json'
+        },
+        body: JSON.stringify({ from, to, subject: assunto, text: corpo })
+      });
+      if (!resp.ok) {
+        const detalhe = await resp.text().catch(() => '');
+        return err(res, 'Resend ' + resp.status + ': ' + detalhe, 502);
+      }
+      return ok(res, { sent: true });
+    } catch (e) {
+      return err(res, e.message);
+    }
+  }
+
   // POST /backup — upload current state (plataforma → servidor)
   if (req.method === 'POST' && u.pathname === '/backup') {
     try {
