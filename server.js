@@ -853,7 +853,7 @@ const TOKEN_STOPWORDS = new Set([
   'make', 'model', 'year', 'price', 'mileage', 'km',
   // Combustível (varia entre sites — ignorar no match)
   'gasolina', 'diesel', 'gasoleo', 'hibrido', 'plug', 'in',
-  'phev', 'bev', 'ev', 'hev', 'mhev', 'eletrico', 'electric',
+  'phev', 'bev', 'ev', 'hev', 'mhev', 'eletrico', 'electrico', 'electric',
   // Transmissão (varia entre sites — ignorar no match)
   'auto', 'manual', 'automatica', 'automatic', 'caixa', 'transmissao',
   // Categorias estruturais do fabricante usadas em URLs do SV mas que
@@ -877,6 +877,47 @@ function tokenizar(s) {
       // ainda descarta as strings vazias que o split produz nas pontas.
       .filter(t => t.length >= 1 && !TOKEN_STOPWORDS.has(t))
   );
+}
+
+// ── Lemon Squeezy — licenças (extensão Carscore) ──────────────────────────
+// A "License API" da Lemon é SEPARADA da API normal e NÃO precisa de chave
+// secreta: basta a própria license_key. Pede-se Accept: application/json e
+// envia-se o corpo como application/x-www-form-urlencoded.
+// Segurança: confirmar que store_id/product_id da resposta batem com os
+// NOSSOS — senão qualquer chave Lemon de outra loja desbloquearia a extensão.
+//
+// ⚠️ COLE AQUI os números da sua loja/produto quando criar o produto na Lemon
+//    (ou defina LEMON_STORE_ID / LEMON_PRODUCT_ID como variáveis no Railway).
+//    Enquanto forem null, os endpoints respondem 503 de propósito — para nunca
+//    validar contra "qualquer loja".
+const LEMON_STORE_ID   = process.env.LEMON_STORE_ID   || null; // ex.: "123456"
+const LEMON_PRODUCT_ID = process.env.LEMON_PRODUCT_ID || null; // ex.: "987654"
+const LEMON_LICENSE_BASE = 'https://api.lemonsqueezy.com/v1/licenses';
+
+function lemonConfigOk() {
+  return LEMON_STORE_ID != null && LEMON_PRODUCT_ID != null;
+}
+
+// Confirma que a resposta da Lemon pertence à NOSSA loja/produto.
+function lemonPertenceAMim(meta) {
+  if (!meta) return false;
+  return String(meta.store_id)   === String(LEMON_STORE_ID)
+      && String(meta.product_id) === String(LEMON_PRODUCT_ID);
+}
+
+async function lemonLicenseCall(action, params) {
+  // action: 'activate' | 'validate' | 'deactivate'
+  const resp = await fetch(`${LEMON_LICENSE_BASE}/${action}`, {
+    method: 'POST',
+    headers: {
+      'Accept': 'application/json',
+      'Content-Type': 'application/x-www-form-urlencoded',
+    },
+    body: new URLSearchParams(params).toString(),
+  });
+  let json = null;
+  try { json = await resp.json(); } catch (e) { json = null; }
+  return { httpStatus: resp.status, json };
 }
 
 // ── HTTP Server ───────────────────────────────────────────────────────────
@@ -1759,11 +1800,25 @@ const server = http.createServer(async (req, res) => {
         }
         if (nActive < 3) continue;
 
-        // Tokens da análise (search_key + search_label) — o tokenizar já
-        // remove stopwords técnicas como 'filter', 'enum', 'search', etc.
-        const tokensAnalise = tokenizar(
-          (a.search_key || '') + ' ' + (a.search_label || '')
-        );
+        // Tokens da análise. Usamos só o CAMINHO do search_key (corta tudo
+        // a partir do '?'): a query string do SV traz filtros como
+        // ?search[filter_enum_fuel_type]=...&advanced_search_expanded=true
+        // cujas palavras (fuel, type, advanced, expanded, true) o MB.de/AS24
+        // nunca tem e afundavam o score abaixo dos 80% (ex.: Atto 2 dava 33%).
+        // O caminho (/carros/marca/modelo) já tem marca+modelo, que é o que
+        // interessa para o match.
+        const searchKeyPath = (a.search_key || '').split('?')[0];
+        // Remover segmentos estruturais de categoria (serie-3, classe-c,
+        // série 3...) ANTES de tokenizar. Sem isto, o dígito/letra da
+        // categoria (o "3" de "Série 3") fica como token solto que o
+        // MB.de/AS24 não tem (lá o modelo vem como "330d", sem a série) e
+        // afunda o score. O stopword 'serie'/'classe' só apanhava a palavra,
+        // não o número/letra colado a seguir. NÃO afecta o "2" de "atto-2"
+        // porque "atto" não é categoria.
+        const textoMatch = (searchKeyPath + ' ' + (a.search_label || ''))
+          .normalize('NFD').replace(/[\u0300-\u036f]/g, '')
+          .replace(/\b(classe|class|series|serie)[\s\-]?[a-z0-9]{1,2}\b/gi, ' ');
+        const tokensAnalise = tokenizar(textoMatch);
         if (tokensAnalise.size === 0) continue;
 
         // Marca obrigatória: pelo menos um token da marca tem de existir
@@ -1845,6 +1900,91 @@ const server = http.createServer(async (req, res) => {
       return ok(res, lista);
     } catch (e) {
       return err(res, 'GET /sv-analyses: ' + e.message, 500);
+    }
+  }
+
+  // ── Licenças (extensão Carscore) ─────────────────────────────────────────
+  // Ativar a chave neste dispositivo.
+  if (req.method === 'POST' && u.pathname === '/license/activate') {
+    try {
+      if (!lemonConfigOk()) return err(res, 'Licenciamento ainda não configurado no servidor', 503);
+      const b = await readBody(req);
+      const licenseKey   = (b.license_key   || '').toString().trim();
+      const instanceName = (b.instance_name || 'Carscore').toString().trim().slice(0, 80);
+      if (!licenseKey) return err(res, 'license_key obrigatória');
+
+      const r = await lemonLicenseCall('activate', { license_key: licenseKey, instance_name: instanceName });
+      if (!r.json) return err(res, 'Resposta inválida da Lemon Squeezy', 502);
+
+      // Chave inválida / limite de ativações atingido → activated:false + error.
+      if (!r.json.activated) {
+        return ok(res, { ok: false, error: r.json.error || 'Não foi possível ativar a chave.' });
+      }
+      // É mesmo da nossa loja/produto?
+      if (!lemonPertenceAMim(r.json.meta)) {
+        return ok(res, { ok: false, error: 'Esta chave não pertence ao Carscore.' });
+      }
+      const lk = r.json.license_key || {};
+      const inst = r.json.instance || {};
+      return ok(res, {
+        ok: true,
+        instance_id: inst.id || null,
+        status: lk.status || 'active',      // active | expired | disabled
+        expires_at: lk.expires_at || null,  // null = renova com a subscrição
+      });
+    } catch (e) {
+      return err(res, 'POST /license/activate: ' + e.message, 502);
+    }
+  }
+
+  // Verificar se a chave/instância continua válida.
+  if (req.method === 'POST' && u.pathname === '/license/validate') {
+    try {
+      if (!lemonConfigOk()) return err(res, 'Licenciamento ainda não configurado no servidor', 503);
+      const b = await readBody(req);
+      const licenseKey = (b.license_key || '').toString().trim();
+      const instanceId = (b.instance_id || '').toString().trim();
+      if (!licenseKey) return err(res, 'license_key obrigatória');
+
+      const params = { license_key: licenseKey };
+      if (instanceId) params.instance_id = instanceId;
+      const r = await lemonLicenseCall('validate', params);
+      if (!r.json) return err(res, 'Resposta inválida da Lemon Squeezy', 502);
+
+      // Sem meta = chave desconhecida/inválida.
+      if (!r.json.meta) {
+        return ok(res, { ok: true, valid: false, status: null, expires_at: null });
+      }
+      if (!lemonPertenceAMim(r.json.meta)) {
+        return ok(res, { ok: false, valid: false, error: 'Esta chave não pertence ao Carscore.' });
+      }
+      const lk = r.json.license_key || {};
+      return ok(res, {
+        ok: true,
+        valid: !!r.json.valid,
+        status: lk.status || null,
+        expires_at: lk.expires_at || null,
+      });
+    } catch (e) {
+      return err(res, 'POST /license/validate: ' + e.message, 502);
+    }
+  }
+
+  // Remover (desativar) a instância deste dispositivo.
+  if (req.method === 'POST' && u.pathname === '/license/deactivate') {
+    try {
+      if (!lemonConfigOk()) return err(res, 'Licenciamento ainda não configurado no servidor', 503);
+      const b = await readBody(req);
+      const licenseKey = (b.license_key || '').toString().trim();
+      const instanceId = (b.instance_id || '').toString().trim();
+      if (!licenseKey || !instanceId) return err(res, 'license_key e instance_id obrigatórios');
+
+      const r = await lemonLicenseCall('deactivate', { license_key: licenseKey, instance_id: instanceId });
+      if (!r.json) return err(res, 'Resposta inválida da Lemon Squeezy', 502);
+
+      return ok(res, { ok: !!r.json.deactivated, error: r.json.error || null });
+    } catch (e) {
+      return err(res, 'POST /license/deactivate: ' + e.message, 502);
     }
   }
 
