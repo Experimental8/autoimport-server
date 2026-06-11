@@ -870,7 +870,12 @@ function tokenizar(s) {
     s.toLowerCase()
       .normalize('NFD').replace(/[\u0300-\u036f]/g, '')  // remover acentos
       .split(/[^a-z0-9]+/)
-      .filter(t => t.length >= 2 && !TOKEN_STOPWORDS.has(t))
+      // length >= 1 (não >= 2): mantém tokens de 1 caráter como o "2" de
+      // "Atto 2" / "3" de "Atto 3" / "2" de "Mazda 2". Sem isto, modelos
+      // distinguidos por um único dígito ficavam indistinguíveis e o lookup
+      // devolvia o modelo errado (ex.: Atto 2 → dados do Atto 3). O >= 1
+      // ainda descarta as strings vazias que o split produz nas pontas.
+      .filter(t => t.length >= 1 && !TOKEN_STOPWORDS.has(t))
   );
 }
 
