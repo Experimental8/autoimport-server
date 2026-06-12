@@ -1501,20 +1501,55 @@ const server = http.createServer(async (req, res) => {
       // Carros 2018 ficam ambíguos: query genérica em vez de forçar protocolo.
       const protocoloProvavel = ano >= 2019 ? 'WLTP' : (ano <= 2017 ? 'NEDC' : '');
 
-      if (braveKey) {
-        const queries = [
-          desc + ' CO2 emissions g/km',
-          marca + ' ' + modelo + ' ' + (b.submodelo || '') + ' ' + ano + ' ' + fuelEN + ' CO2 specifications',
-          protocoloProvavel
-            ? marca + ' ' + modelo + ' ' + ano + ' ' + fuelEN + ' ' + protocoloProvavel + ' CO2'
-            : marca + ' ' + modelo + ' ' + ano + ' ' + fuelEN + ' technical data CO2'
-        ];
-        // Para PHEV o CO2 "ponderado" é diferente do CO2 a gasolina puro;
-        // query específica encontra trechos com weighted/combined.
-        if (fuelNorm === 'phev') {
-          queries.push(marca + ' ' + modelo + ' ' + ano + ' plug-in hybrid weighted CO2 electric range km');
-        }
-        for (const q of queries) {
+      // Descritor limpo só em inglês para os sites de specs. O 'desc' acima
+      // tem ruído PT (gasóleo, potência, caixa, norma) que, misturado com
+      // inglês, fazia a 1ª query vir sempre vazia (caso BMW 320d 2025).
+      const descEN = [marca, modelo, b.submodelo, ano, fuelEN].filter(Boolean).join(' ');
+
+      // Caixa em inglês para entrar em ALGUMAS queries (auto vs manual pode dar
+      // CO2 de homologação diferente). Não entra em todas, para não
+      // sobre-especificar e voltar ao problema do 320d 2025 (queries vazias).
+      const transmNorm = normTransm(b.transmissao);
+      const transmEN = transmNorm === 'auto' ? 'automatic'
+                     : transmNorm === 'manual' ? 'manual' : '';
+
+      // Classificação da fonte de cada trecho (oficiais valem mais).
+      //  - 'oficial' : a marca é o NOME PRINCIPAL do domínio (bmw.de, bmw.pt,
+      //                www.bmw.com.br). Não basta conter "bmw": um forum-bmw.pt
+      //                ou bmwblog.com NÃO são oficiais. Marcas de domínio curto
+      //                (Volkswagen→vw.com) ficam em 'outra' — usadas na mesma,
+      //                só sem prioridade. Preferimos falhar para 'outra' do que
+      //                marcar um fórum como oficial (mais seguro).
+      //  - 'tecnica' : bases técnicas reconhecidas (número exacto por versão).
+      //  - 'outra'   : restantes (usadas só se as de cima não derem número).
+      const TRUSTED_SPECS = new Set([
+        'carfolio.com', 'automobile-catalog.com', 'ev-database.org',
+        'ultimatespecs.com', 'cars-data.com'
+      ]);
+      const marcaToken = marca.toLowerCase().normalize('NFD')
+        .replace(/[\u0300-\u036f]/g, '').replace(/[^a-z0-9]/g, '');
+      // Nome principal do domínio (label antes do TLD), saltando SLD públicos
+      // tipo .com.br / .co.uk, e sem hífens (mercedes-benz → mercedesbenz).
+      const SLD_PUBLICOS = new Set(['com', 'co', 'org', 'net', 'gov', 'edu']);
+      const dominioPrincipal = (dominio) => {
+        const labels = (dominio || '').split('.').filter(Boolean);
+        if (labels.length < 2) return '';
+        let i = labels.length - 1;                                 // TLD
+        if (i >= 2 && SLD_PUBLICOS.has(labels[i - 1])) i -= 1;     // .com.br / .co.uk
+        return (labels[i - 1] || '').replace(/[^a-z0-9]/g, '');
+      };
+      const classificarFonte = (dominio) => {
+        if ([...TRUSTED_SPECS].some(s => dominio === s || dominio.endsWith('.' + s))) return 'tecnica';
+        if (marcaToken && marcaToken.length >= 3 && dominioPrincipal(dominio) === marcaToken) return 'oficial';
+        return 'outra';
+      };
+
+      // Corre uma lista de queries no Brave (3 tentativas cada por soluços
+      // temporários) e empilha os trechos (com domínio + tier) em `trechos`.
+      // Extraído para função para poder correr 2 lotes: primeiro com ano e —
+      // só se vier vazio — um mais largo sem ano (ver abaixo).
+      const correrQueries = async (lista) => {
+        for (const q of lista) {
           for (let tentativa = 1; tentativa <= 3; tentativa++) {
             try {
               const bUrl = 'https://api.search.brave.com/res/v1/web/search?q=' + encodeURIComponent(q) + '&count=3';
@@ -1527,13 +1562,50 @@ const server = http.createServer(async (req, res) => {
               const results = (bData && bData.web && bData.web.results) || [];
               results.forEach(r => {
                 const t = ((r.title || '') + ' — ' + (r.description || '')).replace(/\s+/g, ' ').trim();
-                if (t) trechos.push(t.slice(0, 300));
+                if (!t) return;
+                let dominio = '';
+                try { dominio = ((r.meta_url && r.meta_url.hostname) || new URL(r.url).hostname || '').replace(/^www\./, ''); } catch (e) {}
+                trechos.push({ dominio: dominio, tier: classificarFonte(dominio), texto: t.slice(0, 300) });
               });
               break; // query bem-sucedida → próxima query
             } catch (e) {
               if (tentativa < 3) { await sleep(tentativa * 500); continue; }
             }
           }
+        }
+      };
+
+      if (braveKey) {
+        const cx = transmEN ? ' ' + transmEN : '';
+        const queriesAno = [
+          // 1ª fica larga (sem caixa) para garantir que há resultados.
+          descEN + ' CO2 emissions g/km',
+          // 2ª e 3ª levam a caixa quando conhecida (auto≠manual no CO2).
+          marca + ' ' + modelo + ' ' + (b.submodelo || '') + ' ' + ano + ' ' + fuelEN + cx + ' CO2 specifications',
+          protocoloProvavel
+            ? marca + ' ' + modelo + ' ' + ano + ' ' + fuelEN + cx + ' ' + protocoloProvavel + ' CO2'
+            : marca + ' ' + modelo + ' ' + ano + ' ' + fuelEN + cx + ' technical data CO2'
+        ];
+        // Para PHEV o CO2 "ponderado" é diferente do CO2 a gasolina puro;
+        // query específica encontra trechos com weighted/combined.
+        if (fuelNorm === 'phev') {
+          queriesAno.push(marca + ' ' + modelo + ' ' + ano + ' plug-in hybrid weighted CO2 electric range km');
+        }
+        await correrQueries(queriesAno);
+
+        // Recurso para carros muito recentes (ex.: BMW 320d 2025): os sites de
+        // specs indexam por geração, não pelo ano à risca, e forçar o ano em
+        // todas as queries devolvia zero trechos. Se o lote com ano não trouxe
+        // nada, tenta sem ano. A IA continua ancorada na web (não adivinha);
+        // o ano segue na descrição do prompt para escolher a norma WLTP/NEDC.
+        if (!trechos.length) {
+          const queriesSemAno = [
+            marca + ' ' + modelo + ' ' + (b.submodelo || '') + ' ' + fuelEN + ' CO2 emissions g/km',
+            protocoloProvavel
+              ? marca + ' ' + modelo + ' ' + fuelEN + ' ' + protocoloProvavel + ' CO2 emissions'
+              : marca + ' ' + modelo + ' ' + fuelEN + ' CO2 emissions technical data'
+          ];
+          await correrQueries(queriesSemAno);
         }
       }
 
@@ -1545,11 +1617,20 @@ const server = http.createServer(async (req, res) => {
           nota: 'Sem informação web suficiente — preenche à mão (valor do COC).'
         });
       }
-      contextoWeb = '\n\nResultados de pesquisa web (ÚNICA fonte permitida):\n- '
-        + trechos.slice(0, 12).join('\n- ');
+      // Ordenar por fiabilidade da fonte: oficiais primeiro, depois bases
+      // técnicas, depois as restantes. A IA recebe a lista já priorizada e o
+      // domínio de cada trecho; o prompt diz-lhe para preferir as de cima.
+      const ordemTier = { oficial: 0, tecnica: 1, outra: 2 };
+      trechos.sort((a, b2) => (ordemTier[a.tier] - ordemTier[b2.tier]));
+      const topTrechos = trechos.slice(0, 12);
+      contextoWeb = '\n\nResultados de pesquisa web (ÚNICA fonte permitida, ordenados por fiabilidade da fonte):\n'
+        + topTrechos.map(x => '- [' + (x.tier === 'oficial' ? 'OFICIAL ' + x.dominio
+                                     : x.tier === 'tecnica' ? 'TÉCNICA ' + x.dominio
+                                     : (x.dominio || 'web')) + '] ' + x.texto).join('\n');
+      const nOficial = trechos.filter(x => x.tier === 'oficial').length;
       console.log('[co2-suggest]', marca, modelo, ano, fuelNorm,
                   b.pais_vendedor ? '('+b.pais_vendedor+')' : '',
-                  '→ trechos:', trechos.length);
+                  '→ trechos:', trechos.length, '(oficiais:', nOficial + ')');
 
       // Mercado: ajuda a desambiguar versões nacionais (ex.: BMW 218 versão
       // IT vs DE pode ter CO2 ligeiramente diferente). Vazio se não enviado.
@@ -1563,6 +1644,7 @@ const server = http.createServer(async (req, res) => {
         + 'Veículo: ' + desc + mercado + '.'
         + contextoWeb
         + ' Baseia-te EXCLUSIVAMENTE nos resultados de pesquisa acima. '
+        + 'Dá prioridade aos resultados marcados [OFICIAL ...] (sites da própria marca); a seguir aos [TÉCNICA ...] (bases de dados de especificações); usa os restantes só se os primeiros não derem um valor claro. '
         + 'NÃO uses conhecimento geral nem adivinhes: se os resultados não permitirem uma estimativa fiável, devolve 0 e confianca "baixa". '
         + 'Norma de homologação: carros matriculados em 2019 ou mais recente são WLTP; em 2017 ou anterior são NEDC; 2018 é zona de transição (escolhe conforme indicado nos resultados). '
         + 'Responde APENAS com JSON, sem texto antes nem depois, no formato exacto: '
@@ -1641,7 +1723,12 @@ const server = http.createServer(async (req, res) => {
         saveData(data);
       }
 
-      return ok(res, { co2: co2, norma: norma, autonomia: autonomia, confianca: confianca, nota: nota, fonte: 'ia' });
+      // Devolver a fonte para a extensão poder mostrar de onde veio o valor.
+      // fonte_oficial = houve algum trecho do site da marca entre os usados.
+      // fontes = até 3 domínios de topo (já ordenados por fiabilidade).
+      const fonteOficial = topTrechos.some(x => x.tier === 'oficial');
+      const fontes = topTrechos.slice(0, 3).map(x => x.dominio).filter(Boolean);
+      return ok(res, { co2: co2, norma: norma, autonomia: autonomia, confianca: confianca, nota: nota, fonte: 'ia', fonte_oficial: fonteOficial, fontes: fontes });
     } catch (e) {
       return err(res, e.message, 500);
     }
