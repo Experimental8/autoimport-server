@@ -301,6 +301,13 @@ function lookupSpecsForRaw(raw, specsCache) {
   // EXACTAMENTE igual ao anterior (zero impacto na B2B).
   const tq = (raw && raw.__transmissaoNorm) || '';
 
+  // Potência pedida (bucket de 10): SÓ definida pelo /co2-suggest
+  // (raw.__potBucket). Distingue variantes do MESMO modelo/geração — ex.:
+  // Porsche 991 GT3 RS (~500cv) vs 991 Carrera (~370cv), que de outra forma
+  // a cache juntava por terem marca|modelo|ano|combustível iguais. A B2B
+  // nunca passa __potBucket → pq='' → comportamento igual ao anterior.
+  const pq = (raw && raw.__potBucket != null) ? String(raw.__potBucket) : '';
+
   // Chave do cliente: marca|modelo|subFirst|ano|combustivel|pot[|transm]
   // Servidor procura com prefixo: marca|modelo|*|ano|combustivel|*
   // (subFirst e pot variam, vamos fazer match parcial)
@@ -309,16 +316,27 @@ function lookupSpecsForRaw(raw, specsCache) {
     const parts = key.split('|');
     if (parts.length < 5) continue;
     if (parts[0] === make && parts[1] === model && parseInt(parts[3]) === year && parts[4] === fuel) {
-      if (val && val.co2) todos.push({ v: val, tr: parts[6] || '' });
+      if (val && val.co2) todos.push({ v: val, tr: parts[6] || '', pot: parts[5] || '0' });
     }
   }
   if (!todos.length) return null;
 
+  let pool = todos;
+
+  // Filtro por potência (só quando o cliente a envia — extensão). Se NÃO
+  // houver entrada da mesma potência, devolve null (cache-miss) → vai à IA
+  // buscar o valor certo, em vez de devolver a média de outra variante.
+  // (Não cai na média: era isso que dava o CO2 do Carrera a um GT3 RS.)
+  if (pq) {
+    const mesmaPot = pool.filter(m => m.pot === pq);
+    if (!mesmaPot.length) return null;
+    pool = mesmaPot;
+  }
+
   // Se sabemos a transmissão e há entradas dessa transmissão → usar SÓ essas
   // (PDK ≠ manual). Senão, cair na média de todas (comportamento antigo).
-  let pool = todos;
   if (tq) {
-    const mesmaTr = todos.filter(m => m.tr === tq);
+    const mesmaTr = pool.filter(m => m.tr === tq);
     if (mesmaTr.length) pool = mesmaTr;
   }
   const matches = pool.map(m => m.v);
@@ -1462,7 +1480,11 @@ const server = http.createServer(async (req, res) => {
 
       // 1) Cache-first — reutiliza lookupSpecsForRaw (igual à plataforma B2B)
       const specsCache = (loadData().specsCache) || {};
-      const pseudoRaw = { make: marca, model: modelo, fuel: fuelNorm, year: ano, engineSize: b.cilindrada || 0, __transmissaoNorm: normTransm(b.transmissao) };
+      // Potência em bucket de 10 (mesmo cálculo da escrita, mais abaixo). Só a
+      // passamos quando é conhecida — assim a cache distingue variantes pela
+      // potência (GT3 RS vs Carrera). Sem potência → null → comportamento antigo.
+      const potParaCache = parseInt(b.potencia) || 0;
+      const pseudoRaw = { make: marca, model: modelo, fuel: fuelNorm, year: ano, engineSize: b.cilindrada || 0, __transmissaoNorm: normTransm(b.transmissao), __potBucket: potParaCache > 0 ? String(Math.round(potParaCache / 10) * 10) : null };
       const hit = lookupSpecsForRaw(pseudoRaw, specsCache);
       // Só usar a cache se tiver o necessário: CO2 sempre; autonomia quando o
       // carro precisa dela. Se faltar autonomia num PHEV, cai para a IA.
