@@ -1990,14 +1990,22 @@ const server = http.createServer(async (req, res) => {
         const score = matches / tokensAnalise.size;
 
         if (score >= 0.8) {
-          candidatos.push({ analise: a, score: score, nActive: nActive });
+          // matches = nº de tokens da análise presentes no carro. Serve de
+          // medida de ESPECIFICIDADE: a análise "991 · GT3 RS" cobre 4 tokens
+          // (porsche, 991, gt3, rs); a genérica "991" cobre 2. Usado abaixo
+          // para desempatar a favor da mais específica.
+          candidatos.push({ analise: a, score: score, matches: matches, nActive: nActive });
         }
       }
 
       if (candidatos.length === 0) return ok(res, null);
 
-      // Ordenar: maior score, mais activos, mais recente
+      // Ordenar: PRIMEIRO a mais específica (cobre mais tokens do carro) —
+      // senão uma pesquisa genérica "991" (mais anúncios) ganhava sempre à
+      // específica "991 · GT3 RS" e dava a mediana de todas as versões. Depois
+      // maior score, mais activos, mais recente.
       candidatos.sort((x, y) => {
+        if (y.matches !== x.matches) return y.matches - x.matches;
         if (y.score !== x.score) return y.score - x.score;
         if (y.nActive !== x.nActive) return y.nActive - x.nActive;
         return (y.analise.last_updated || 0) - (x.analise.last_updated || 0);
