@@ -1523,10 +1523,38 @@ const server = http.createServer(async (req, res) => {
       // Carros 2018 ficam ambíguos: query genérica em vez de forçar protocolo.
       const protocoloProvavel = ano >= 2019 ? 'WLTP' : (ano <= 2017 ? 'NEDC' : '');
 
+      // Submodelo limpo: tira pontuação/parênteses e palavras de stand que não
+      // definem a versão (LIFT, PCCB, PCM, PTS, navi...). Sem isto, anúncios
+      // como "Porsche 991 -1 (911) GT3 RS PTS,Lift,PCM" afogavam o "GT3 RS" e
+      // a pesquisa caía num 911 genérico (≈ Carrera, ~207 g/km) em vez do GT3 RS
+      // (~296). A lista é curta de propósito — cobre o comum, é fácil de alargar.
+      const SUB_JUNK = new Set([
+        'lift', 'pccb', 'pcm', 'pts', 'pdk', 'bose', 'burmester', 'led', 'xenon',
+        'matrix', 'navi', 'navigation', 'chrono', 'sportchrono', 'approved',
+        'approvedfahig', 'garantie', 'garantia', 'scheckheft', 'voll',
+        'vollausstattung', 'paket', 'packet', 'package', 'kamera', 'camera',
+        'leder', 'klima', 'memory', 'keyless', 'hud', 'acc'
+      ]);
+      const limparSubmodelo = (sub) => {
+        return (sub || '').toString()
+          .replace(/[(),/\\.;:]+/g, ' ')                 // pontuação → espaço
+          .split(/\s+/)
+          .filter(tok => {
+            if (!tok) return false;
+            const t = tok.toLowerCase().normalize('NFD').replace(/[\u0300-\u036f]/g, '');
+            if (SUB_JUNK.has(t)) return false;            // palavra de stand
+            if (/^-?\d$/.test(tok)) return false;         // dígito solto ("-1")
+            return true;
+          })
+          .slice(0, 4)                                    // não deixar a query enorme
+          .join(' ');
+      };
+      const subLimpo = limparSubmodelo(b.submodelo);
+
       // Descritor limpo só em inglês para os sites de specs. O 'desc' acima
       // tem ruído PT (gasóleo, potência, caixa, norma) que, misturado com
       // inglês, fazia a 1ª query vir sempre vazia (caso BMW 320d 2025).
-      const descEN = [marca, modelo, b.submodelo, ano, fuelEN].filter(Boolean).join(' ');
+      const descEN = [marca, modelo, subLimpo, ano, fuelEN].filter(Boolean).join(' ');
 
       // Caixa em inglês para entrar em ALGUMAS queries (auto vs manual pode dar
       // CO2 de homologação diferente). Não entra em todas, para não
@@ -1546,7 +1574,7 @@ const server = http.createServer(async (req, res) => {
       //  - 'outra'   : restantes (usadas só se as de cima não derem número).
       const TRUSTED_SPECS = new Set([
         'carfolio.com', 'automobile-catalog.com', 'ev-database.org',
-        'ultimatespecs.com', 'cars-data.com'
+        'ultimatespecs.com', 'cars-data.com', 'car-emissions.com', 'auto-data.net'
       ]);
       const marcaToken = marca.toLowerCase().normalize('NFD')
         .replace(/[\u0300-\u036f]/g, '').replace(/[^a-z0-9]/g, '');
@@ -1599,14 +1627,16 @@ const server = http.createServer(async (req, res) => {
 
       if (braveKey) {
         const cx = transmEN ? ' ' + transmEN : '';
+        const sub = subLimpo ? ' ' + subLimpo : '';
         const queriesAno = [
           // 1ª fica larga (sem caixa) para garantir que há resultados.
           descEN + ' CO2 emissions g/km',
-          // 2ª e 3ª levam a caixa quando conhecida (auto≠manual no CO2).
-          marca + ' ' + modelo + ' ' + (b.submodelo || '') + ' ' + ano + ' ' + fuelEN + cx + ' CO2 specifications',
+          // 2ª e 3ª levam o submodelo limpo (a versão, ex. "GT3 RS") + a caixa
+          // quando conhecida. Sem o submodelo, "991" sozinho dava um 911 genérico.
+          marca + ' ' + modelo + sub + ' ' + ano + ' ' + fuelEN + cx + ' CO2 specifications',
           protocoloProvavel
-            ? marca + ' ' + modelo + ' ' + ano + ' ' + fuelEN + cx + ' ' + protocoloProvavel + ' CO2'
-            : marca + ' ' + modelo + ' ' + ano + ' ' + fuelEN + cx + ' technical data CO2'
+            ? marca + ' ' + modelo + sub + ' ' + ano + ' ' + fuelEN + cx + ' ' + protocoloProvavel + ' CO2'
+            : marca + ' ' + modelo + sub + ' ' + ano + ' ' + fuelEN + cx + ' technical data CO2'
         ];
         // Para PHEV o CO2 "ponderado" é diferente do CO2 a gasolina puro;
         // query específica encontra trechos com weighted/combined.
@@ -1622,10 +1652,10 @@ const server = http.createServer(async (req, res) => {
         // o ano segue na descrição do prompt para escolher a norma WLTP/NEDC.
         if (!trechos.length) {
           const queriesSemAno = [
-            marca + ' ' + modelo + ' ' + (b.submodelo || '') + ' ' + fuelEN + ' CO2 emissions g/km',
+            marca + ' ' + modelo + sub + ' ' + fuelEN + ' CO2 emissions g/km',
             protocoloProvavel
-              ? marca + ' ' + modelo + ' ' + fuelEN + ' ' + protocoloProvavel + ' CO2 emissions'
-              : marca + ' ' + modelo + ' ' + fuelEN + ' CO2 emissions technical data'
+              ? marca + ' ' + modelo + sub + ' ' + fuelEN + ' ' + protocoloProvavel + ' CO2 emissions'
+              : marca + ' ' + modelo + sub + ' ' + fuelEN + ' CO2 emissions technical data'
           ];
           await correrQueries(queriesSemAno);
         }
@@ -1639,10 +1669,16 @@ const server = http.createServer(async (req, res) => {
           nota: 'Sem informação web suficiente — preenche à mão (valor do COC).'
         });
       }
-      // Ordenar por fiabilidade da fonte: oficiais primeiro, depois bases
-      // técnicas, depois as restantes. A IA recebe a lista já priorizada e o
-      // domínio de cada trecho; o prompt diz-lhe para preferir as de cima.
-      const ordemTier = { oficial: 0, tecnica: 1, outra: 2 };
+      // Ordenar por fiabilidade da fonte. ATENÇÃO ao ano: o site da marca só
+      // tem o MODELO ATUAL — para um carro antigo mostra a geração de agora
+      // (ex.: porsche.com dá ~242 para o GT3 RS de hoje, mas o 991 de 2016 são
+      // 296). Por isso, para carros com >= 4 anos, pomos as bases técnicas
+      // (valor por ano) à frente das oficiais. Recentes: oficial primeiro.
+      const anoAtual = new Date().getFullYear();
+      const carroAntigo = (anoAtual - ano) >= 4;
+      const ordemTier = carroAntigo
+        ? { tecnica: 0, oficial: 1, outra: 2 }
+        : { oficial: 0, tecnica: 1, outra: 2 };
       trechos.sort((a, b2) => (ordemTier[a.tier] - ordemTier[b2.tier]));
       const topTrechos = trechos.slice(0, 12);
       contextoWeb = '\n\nResultados de pesquisa web (ÚNICA fonte permitida, ordenados por fiabilidade da fonte):\n'
@@ -1666,8 +1702,9 @@ const server = http.createServer(async (req, res) => {
         + 'Veículo: ' + desc + mercado + '.'
         + contextoWeb
         + ' Baseia-te EXCLUSIVAMENTE nos resultados de pesquisa acima. '
-        + 'Dá prioridade aos resultados marcados [OFICIAL ...] (sites da própria marca); a seguir aos [TÉCNICA ...] (bases de dados de especificações); usa os restantes só se os primeiros não derem um valor claro. '
-        + 'NÃO uses conhecimento geral nem adivinhes: se os resultados não permitirem uma estimativa fiável, devolve 0 e confianca "baixa". '
+        + 'Os resultados estão ordenados por fiabilidade para ESTE veículo — prefere os primeiros. '
+        + 'ATENÇÃO ao ano: o veículo é de ' + ano + '. As páginas oficiais da marca mostram muitas vezes o MODELO ATUAL (outra geração), com valores diferentes — NÃO uses um valor a menos que corresponda ao ano/geração deste veículo. Para carros mais antigos, as bases técnicas que indicam o ano específico são mais fiáveis do que o site atual da marca. '
+        + 'NÃO uses conhecimento geral nem adivinhes: se os resultados não permitirem uma estimativa fiável para este ano, devolve 0 e confianca "baixa". '
         + 'Norma de homologação: carros matriculados em 2019 ou mais recente são WLTP; em 2017 ou anterior são NEDC; 2018 é zona de transição (escolhe conforme indicado nos resultados). '
         + 'Responde APENAS com JSON, sem texto antes nem depois, no formato exacto: '
         + '{"co2": <número g/km>, "autonomia": <autonomia elétrica em km, ou 0 se não aplicável/desconhecida>, "norma": "WLTP" ou "NEDC", "confianca": "alta" ou "média" ou "baixa", "nota": "<frase curta>"}.';
