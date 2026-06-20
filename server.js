@@ -926,6 +926,14 @@ const LEMON_API_KEY        = process.env.LEMON_API_KEY        || null;
 const LEMON_WEBHOOK_SECRET = process.env.LEMON_WEBHOOK_SECRET || null;
 const LEMON_API_BASE       = 'https://api.lemonsqueezy.com/v1';
 
+// Interruptor do "gate" de licença nos endpoints pagos (/co2-suggest,
+// /sv-analyses/lookup, /bug-report). Nasce DESLIGADO: o servidor pode ir para
+// produção com este código sem partir nada. Só quando a EXTENSÃO já enviar o
+// cabeçalho X-License-Key é que se liga (pôr LICENSE_GATE_ENABLED=1 no Railway).
+// Com ele desligado, os endpoints comportam-se exatamente como antes.
+const LICENSE_GATE_ENABLED = process.env.LICENSE_GATE_ENABLED === '1'
+                          || process.env.LICENSE_GATE_ENABLED === 'true';
+
 function lemonConfigOk() {
   return LEMON_STORE_ID != null && LEMON_PRODUCT_ID != null;
 }
@@ -982,7 +990,51 @@ function lemonWebhookValido(rawBody, signature) {
   return crypto.timingSafeEqual(a, b);
 }
 
-// Lê o corpo CRU do pedido (sem fazer JSON.parse) — preciso para a assinatura,
+// Decide se um pedido aos endpoints PAGOS tem licença com acesso.
+// Lê a chave do cabeçalho X-License-Key, valida-a na Lemon (mesma lógica do
+// /license/validate) e aplica a regra: acesso se a subscrição estiver "active",
+// em avaliação ("on_trial") ainda dentro do prazo, ou cancelada mas ainda com
+// período pago. O trial_ends_at vem SEMPRE do servidor (guardado pelo webhook).
+//
+// FALHA ABERTA de propósito: se o licenciamento não estiver configurado, se a
+// Lemon não responder, ou se ainda não houver registo de webhook desta chave,
+// deixa passar. Isto é um travão CONTRA ABUSO, não uma fortaleza — vale mais
+// nunca trancar um cliente legítimo por uma corrida/soluço de rede do que
+// apertar ao máximo. (O cálculo central corre no cliente; ver nota na lista.)
+async function pedidoTemLicenca(req) {
+  if (!lemonConfigOk()) return true;                  // licenciamento não configurado → não trancar
+  const key = (req.headers['x-license-key'] || '').toString().trim();
+  if (!key) return false;                             // sem chave → sem acesso
+
+  let r;
+  try { r = await lemonLicenseCall('validate', { license_key: key }); }
+  catch (e) { return true; }                          // falha de rede → não trancar
+  if (!r.json) return true;                           // resposta ilegível → não trancar
+  if (!r.json.meta) return false;                     // chave desconhecida → sem acesso
+  if (!lemonPertenceAMim(r.json.meta)) return false;  // chave de OUTRA loja → sem acesso
+
+  const agora = Date.now();
+  const noFuturo = (iso) => {
+    const t = new Date(iso).getTime();
+    return Number.isFinite(t) && t > agora;
+  };
+
+  // Estado da subscrição guardado pelo webhook (traz as datas do trial).
+  const sub = (loadData().subscriptions || {})[key] || null;
+  if (sub) {
+    if (sub.status === 'active') return true;
+    if (sub.status === 'on_trial' && sub.trial_ends_at && noFuturo(sub.trial_ends_at)) return true;
+    if (sub.cancelled && sub.ends_at && noFuturo(sub.ends_at)) return true; // cancelou mas ainda pago
+    return false;                                     // registo existe mas não dá acesso (expirado/terminado)
+  }
+
+  // Ainda sem registo de webhook (corrida com a criação) → confiar no estado
+  // da CHAVE: legítima e não desativada/expirada.
+  const lk = r.json.license_key || {};
+  return !!r.json.valid && lk.status !== 'disabled' && lk.status !== 'expired';
+}
+
+
 // porque o HMAC tem de bater com os bytes exatos que a Lemon enviou.
 function readRawBody(req) {
   return new Promise((resolve, reject) => {
@@ -997,7 +1049,7 @@ function readRawBody(req) {
 const server = http.createServer(async (req, res) => {
   res.setHeader('Access-Control-Allow-Origin', '*');
   res.setHeader('Access-Control-Allow-Methods', 'GET, POST, DELETE, OPTIONS');
-  res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
+  res.setHeader('Access-Control-Allow-Headers', 'Content-Type, X-License-Key');
   res.setHeader('Content-Type', 'application/json');
   if (req.method === 'OPTIONS') { res.writeHead(200); res.end(); return; }
 
@@ -1292,6 +1344,9 @@ const server = http.createServer(async (req, res) => {
   // qualquer outro código de erro recorre ao plano B (copiar para a área de
   // transferência). Por isso devolvemos 200 só quando o email saiu mesmo.
   if (req.method === 'POST' && u.pathname === '/bug-report') {
+    if (LICENSE_GATE_ENABLED && !(await pedidoTemLicenca(req))) {
+      return err(res, 'Subscrição necessária', 403);
+    }
     try {
       const body = await readBody(req);
       const assunto = (body.assunto || '').trim();
@@ -1520,6 +1575,9 @@ const server = http.createServer(async (req, res) => {
   // 1) Cache-first (mesmo matching da B2B → consistência total, custo zero)
   // 2) Cache-miss → IA (Anthropic), 3) guarda de volta na cache partilhada.
   if (req.method === 'POST' && u.pathname === '/co2-suggest') {
+    if (LICENSE_GATE_ENABLED && !(await pedidoTemLicenca(req))) {
+      return err(res, 'Subscrição necessária', 403);
+    }
     try {
       const b = await readBody(req);
       const marca = (b.marca || '').toString().trim();
@@ -1974,6 +2032,9 @@ const server = http.createServer(async (req, res) => {
   //  - threshold de 80% para devolver match
   //  - desempate: mais anúncios activos, depois mais recente
   if (req.method === 'GET' && u.pathname === '/sv-analyses/lookup') {
+    if (LICENSE_GATE_ENABLED && !(await pedidoTemLicenca(req))) {
+      return err(res, 'Subscrição necessária', 403);
+    }
     try {
       const tokensMarca = tokenizar(u.searchParams.get('marca') || '');
       const tokensModelo = tokenizar(u.searchParams.get('modelo') || '');
