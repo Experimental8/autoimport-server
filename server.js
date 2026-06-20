@@ -2,6 +2,7 @@ const cron  = require('node-cron');
 const fetch = require('node-fetch');
 const fs    = require('fs');
 const http  = require('http');
+const crypto = require('crypto');  // verificação da assinatura do webhook Lemon
 
 const path  = require('path');
 
@@ -54,14 +55,17 @@ const SV_SYNC_INTERVAL_MS = 2 * 24 * 60 * 60 * 1000;
 
 // ── Persistence ───────────────────────────────────────────────────────────
 function loadData() {
-  if (!fs.existsSync(DATA_FILE)) return { analyses: [], notifications: [], sv_analyses: {} };
+  if (!fs.existsSync(DATA_FILE)) return { analyses: [], notifications: [], sv_analyses: {}, subscriptions: {} };
   try {
     const d = JSON.parse(fs.readFileSync(DATA_FILE, 'utf8'));
     // Migração suave: ficheiros antigos não têm sv_analyses
     if (!d.sv_analyses) d.sv_analyses = {};
+    // Migração suave: ficheiros antigos não têm subscriptions (campos do trial,
+    // guardados pelo webhook por chave de licença — ver /lemon/webhook)
+    if (!d.subscriptions) d.subscriptions = {};
     return d;
   }
-  catch { return { analyses: [], notifications: [], sv_analyses: {} }; }
+  catch { return { analyses: [], notifications: [], sv_analyses: {}, subscriptions: {} }; }
 }
 function saveData(data) { fs.writeFileSync(DATA_FILE, JSON.stringify(data, null, 2)); }
 
@@ -912,6 +916,16 @@ const LEMON_STORE_ID   = process.env.LEMON_STORE_ID   || null; // ex.: "123456"
 const LEMON_PRODUCT_ID = process.env.LEMON_PRODUCT_ID || null; // ex.: "987654"
 const LEMON_LICENSE_BASE = 'https://api.lemonsqueezy.com/v1/licenses';
 
+// Para o webhook que acerta o nº de lugares (activation_limit = quantity):
+//  - LEMON_API_KEY: chave Bearer da API principal (Settings → API), para LER e
+//    ESCREVER nas license keys. (A License API dos /license/* NÃO precisa dela;
+//    esta é só para o webhook.)
+//  - LEMON_WEBHOOK_SECRET: o "Signing secret" que se define ao criar o webhook,
+//    para confirmar que o pedido vem mesmo da Lemon. Sem ele, recusamos.
+const LEMON_API_KEY        = process.env.LEMON_API_KEY        || null;
+const LEMON_WEBHOOK_SECRET = process.env.LEMON_WEBHOOK_SECRET || null;
+const LEMON_API_BASE       = 'https://api.lemonsqueezy.com/v1';
+
 function lemonConfigOk() {
   return LEMON_STORE_ID != null && LEMON_PRODUCT_ID != null;
 }
@@ -936,6 +950,47 @@ async function lemonLicenseCall(action, params) {
   let json = null;
   try { json = await resp.json(); } catch (e) { json = null; }
   return { httpStatus: resp.status, json };
+}
+
+// Chamada à API PRINCIPAL da Lemon (a que precisa de Bearer) — usada pelo webhook
+// para listar a chave de uma encomenda e para lhe acertar o activation_limit.
+async function lemonApiCall(method, apiPath, bodyObj) {
+  const headers = {
+    'Accept': 'application/vnd.api+json',
+    'Authorization': `Bearer ${LEMON_API_KEY}`,
+  };
+  const opts = { method, headers };
+  if (bodyObj) {
+    headers['Content-Type'] = 'application/vnd.api+json';
+    opts.body = JSON.stringify(bodyObj);
+  }
+  const resp = await fetch(`${LEMON_API_BASE}${apiPath}`, opts);
+  let json = null;
+  try { json = await resp.json(); } catch (e) { json = null; }
+  return { httpStatus: resp.status, json };
+}
+
+// Confirma que o webhook vem mesmo da Lemon: HMAC-SHA256 do corpo CRU com o
+// nosso segredo, comparado em tempo constante com o cabeçalho X-Signature.
+function lemonWebhookValido(rawBody, signature) {
+  if (!LEMON_WEBHOOK_SECRET || !signature) return false;
+  const digest = crypto.createHmac('sha256', LEMON_WEBHOOK_SECRET)
+                       .update(rawBody, 'utf8').digest('hex');
+  const a = Buffer.from(digest, 'utf8');
+  const b = Buffer.from(signature, 'utf8');
+  if (a.length !== b.length) return false;
+  return crypto.timingSafeEqual(a, b);
+}
+
+// Lê o corpo CRU do pedido (sem fazer JSON.parse) — preciso para a assinatura,
+// porque o HMAC tem de bater com os bytes exatos que a Lemon enviou.
+function readRawBody(req) {
+  return new Promise((resolve, reject) => {
+    let body = '';
+    req.on('data', d => body += d);
+    req.on('end', () => resolve(body));
+    req.on('error', reject);
+  });
 }
 
 // ── HTTP Server ───────────────────────────────────────────────────────────
@@ -2113,11 +2168,24 @@ const server = http.createServer(async (req, res) => {
         return ok(res, { ok: false, valid: false, error: 'Esta chave não pertence ao Carscore.' });
       }
       const lk = r.json.license_key || {};
+      // Juntar os campos da subscrição que o webhook guardou (trial, estado,
+      // cancelamento, lugares). A extensão usa-os para a contagem do trial.
+      // Aditivo: os campos antigos (valid/status/expires_at) ficam iguais.
+      const sub = (loadData().subscriptions || {})[licenseKey] || null;
       return ok(res, {
         ok: true,
         valid: !!r.json.valid,
-        status: lk.status || null,
+        status: lk.status || null,          // estado da CHAVE: active | expired | disabled
         expires_at: lk.expires_at || null,
+        // estado da SUBSCRIÇÃO (null se ainda não chegou nenhum webhook desta chave):
+        subscription: sub ? {
+          status:        sub.status || null,         // on_trial | active | cancelled | expired | ...
+          trial_ends_at: sub.trial_ends_at || null,
+          renews_at:     sub.renews_at || null,
+          ends_at:       sub.ends_at || null,
+          cancelled:     !!sub.cancelled,
+          quantity:      sub.quantity || null,
+        } : null,
       });
     } catch (e) {
       return err(res, 'POST /license/validate: ' + e.message, 502);
@@ -2139,6 +2207,100 @@ const server = http.createServer(async (req, res) => {
       return ok(res, { ok: !!r.json.deactivated, error: r.json.error || null });
     } catch (e) {
       return err(res, 'POST /license/deactivate: ' + e.message, 502);
+    }
+  }
+
+  // ── Webhook Lemon — acerta o nº de lugares na chave ──────────────────────
+  // A Lemon avisa-nos quando uma subscrição é criada/alterada. Lemos o nº de
+  // lugares comprados (quantity) e pomos esse valor no activation_limit da
+  // chave dessa encomenda — assim a própria Lemon passa a travar a partir do
+  // (lugares+1)-ésimo dispositivo. Os /license/* não mudam.
+  if (req.method === 'POST' && u.pathname === '/lemon/webhook') {
+    // O corpo CRU tem de ser lido ANTES de qualquer parse (para a assinatura).
+    let raw;
+    try { raw = await readRawBody(req); } catch (e) { return err(res, 'corpo ilegível', 400); }
+
+    // Sem segredo do webhook ou sem chave de API não há como verificar/escrever.
+    if (!LEMON_WEBHOOK_SECRET || !LEMON_API_KEY) {
+      return err(res, 'Webhook Lemon ainda não configurado no servidor', 503);
+    }
+    // Confirmar que vem mesmo da Lemon.
+    const sig = (req.headers['x-signature'] || '').toString();
+    if (!lemonWebhookValido(raw, sig)) return err(res, 'Assinatura inválida', 401);
+
+    let payload;
+    try { payload = JSON.parse(raw); } catch (e) { return err(res, 'JSON inválido', 400); }
+
+    const event = (payload.meta && payload.meta.event_name)
+               || (req.headers['x-event-name'] || '').toString();
+    // Só nos interessam estes dois eventos. Os outros confirmam-se com 200.
+    if (event !== 'subscription_created' && event !== 'subscription_updated') {
+      return ok(res, { ok: true, ignored: event || 'sem-evento' });
+    }
+
+    const attrs     = (payload.data && payload.data.attributes) || {};
+    const orderId   = attrs.order_id;
+    const productId = attrs.product_id;
+    const quantity  = attrs.first_subscription_item && attrs.first_subscription_item.quantity;
+
+    // Só o NOSSO produto.
+    if (LEMON_PRODUCT_ID != null && String(productId) !== String(LEMON_PRODUCT_ID)) {
+      return ok(res, { ok: true, ignored: 'produto-diferente' });
+    }
+    if (!orderId || !quantity || quantity < 1) {
+      console.warn('[lemon-webhook] sem order_id/quantity utilizáveis', orderId, quantity);
+      return ok(res, { ok: true, ignored: 'sem-dados' });
+    }
+
+    try {
+      // 1) Encontrar a(s) chave(s) desta encomenda.
+      const list = await lemonApiCall('GET', `/license-keys?filter[order_id]=${encodeURIComponent(orderId)}`);
+      const keys = (list.json && Array.isArray(list.json.data)) ? list.json.data : [];
+      const minhas = keys.filter(k =>
+        String(k.attributes && k.attributes.product_id) === String(LEMON_PRODUCT_ID));
+
+      // A chave pode ainda não existir (corrida com a criação). Devolver 500
+      // faz a Lemon repetir com backoff (5s/25s/125s) → dá tempo a nascer.
+      if (minhas.length === 0) {
+        console.warn('[lemon-webhook] chave ainda não encontrada p/ order', orderId, '→ retry');
+        return err(res, 'chave ainda não disponível, tentar de novo', 500);
+      }
+
+      // 2) Guardar os campos da subscrição (trial, estado, cancelamento, lugares)
+      //    por CHAVE DE LICENÇA — a extensão pede-os ao /license/validate para
+      //    mostrar a contagem do trial. A License API da Lemon não traz estas
+      //    datas; só vêm no objeto da subscrição, que é o que chega aqui.
+      const data = loadData();
+      for (const k of minhas) {
+        const keyStr = k.attributes && k.attributes.key;
+        if (!keyStr) continue;
+        data.subscriptions[keyStr] = {
+          status:        attrs.status || null,        // on_trial | active | cancelled | expired | past_due | paused | unpaid
+          trial_ends_at: attrs.trial_ends_at || null, // fim do período de avaliação
+          renews_at:     attrs.renews_at || null,     // próxima renovação
+          ends_at:       attrs.ends_at || null,       // data em que termina (definida se cancelada)
+          cancelled:     !!attrs.cancelled,           // cancelou (mas pode ainda ter acesso até ends_at)
+          quantity:      quantity,                    // nº de lugares
+          updated_at:    new Date().toISOString(),
+        };
+      }
+      saveData(data);
+
+      // 3) Acertar o activation_limit = quantity em cada chave.
+      for (const k of minhas) {
+        const patch = await lemonApiCall('PATCH', `/license-keys/${k.id}`, {
+          data: { type: 'license-keys', id: String(k.id), attributes: { activation_limit: quantity } }
+        });
+        if (patch.httpStatus >= 300) {
+          console.error('[lemon-webhook] PATCH falhou', k.id, patch.httpStatus, JSON.stringify(patch.json));
+          return err(res, 'PATCH à chave falhou', 500); // retry
+        }
+        console.log(`[lemon-webhook] ${event}: chave ${k.id} → activation_limit=${quantity} (order ${orderId})`);
+      }
+      return ok(res, { ok: true, updated: minhas.length, quantity });
+    } catch (e) {
+      console.error('[lemon-webhook] erro', e.message);
+      return err(res, 'erro no webhook: ' + e.message, 500); // retry
     }
   }
 
