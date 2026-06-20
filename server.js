@@ -1059,6 +1059,7 @@ async function enviarEmailBoasVindas({ email, nome, chave, lugares }) {
     ? `Subscrição para ${lugares} ${lugares == 1 ? 'lugar' : 'lugares'}.`
     : '';
   const portalUrl = 'https://app.lemonsqueezy.com/my-orders';
+  const lugaresParen = lugares ? ` (${lugares} ${lugares == 1 ? 'lugar' : 'lugares'})` : '';
 
   // Versão em texto simples (fallback p/ clientes sem HTML + melhor entrega).
   const texto =
@@ -1077,6 +1078,9 @@ Como começar:
 4. No último ecrã da configuração, colar a chave acima e concluir (despesas de legalização e transporte). A chave também pode ser colada a qualquer momento na janela da extensão.
 
 A partir daí, o cálculo de importação aparece diretamente nos anúncios do Mobile.de, AutoScout24 e StandVirtual.
+
+O seu período de avaliação
+Tem 14 dias de avaliação com acesso completo. Não é cobrado nada durante este período. Ao fim dos 14 dias, a subscrição inicia-se automaticamente no plano escolhido${lugaresParen}, salvo cancelamento até essa data. Pode gerir ou cancelar a subscrição a qualquer momento no portal de cliente: ${portalUrl}
 
 Para gerir lugares, faturação ou cancelar: ${portalUrl}
 Qualquer dúvida: geral@carscore.pt
@@ -1118,6 +1122,11 @@ Carscore · carscore.pt`;
       <a href="${CHROME_STORE_URL}" style="display:inline-block;background:#1B3A6B !important;color:#ffffff !important;font-family:Arial,sans-serif;font-size:15px;font-weight:bold;text-decoration:none;padding:13px 30px;border-radius:8px;">Instalar a extensão</a>
     </td></tr></table>
     <p style="margin:0 0 22px;font-family:Arial,sans-serif;font-size:14px;line-height:1.6;color:#555555;">A partir daí, o cálculo de importação aparece diretamente nos anúncios do Mobile.de, AutoScout24 e StandVirtual.</p>
+    <table role="presentation" cellpadding="0" cellspacing="0" width="100%"><tr><td style="background:#F4F6F9;border:1px solid #E2E8F0;border-radius:8px;padding:16px 18px;">
+      <p style="margin:0 0 8px;font-family:Arial,sans-serif;font-size:14px;font-weight:bold;color:#1B3A6B;">O seu período de avaliação</p>
+      <p style="margin:0;font-family:Arial,sans-serif;font-size:13px;line-height:1.6;color:#555555;">Tem 14 dias de avaliação com acesso completo. Não é cobrado nada durante este período. Ao fim dos 14 dias, a subscrição inicia-se automaticamente no plano escolhido${lugaresParen}, salvo cancelamento até essa data. Pode gerir ou cancelar a subscrição a qualquer momento no <a href="${portalUrl}" style="color:#185FA5;text-decoration:none;">portal de cliente</a>.</p>
+    </td></tr></table>
+    <table role="presentation" cellpadding="0" cellspacing="0" width="100%"><tr><td style="height:22px;line-height:22px;font-size:0;">&nbsp;</td></tr></table>
     <table role="presentation" cellpadding="0" cellspacing="0" width="100%"><tr><td style="border-top:1px solid #eeeeee;padding-top:16px;">
       <p style="margin:0 0 6px;font-family:Arial,sans-serif;font-size:13px;color:#666666;">Para gerir lugares, faturação ou cancelar: <a href="${portalUrl}" style="color:#185FA5;text-decoration:none;">gerir subscrição</a>.</p>
       <p style="margin:0;font-family:Arial,sans-serif;font-size:13px;color:#666666;">Qualquer dúvida: <a href="mailto:geral@carscore.pt" style="color:#185FA5;text-decoration:none;">geral@carscore.pt</a></p>
