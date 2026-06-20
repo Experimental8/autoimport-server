@@ -934,6 +934,19 @@ const LEMON_API_BASE       = 'https://api.lemonsqueezy.com/v1';
 const LICENSE_GATE_ENABLED = process.env.LICENSE_GATE_ENABLED === '1'
                           || process.env.LICENSE_GATE_ENABLED === 'true';
 
+// Email de boas-vindas (Resend), disparado pelo webhook quando uma subscrição
+// é CRIADA. Nasce DESLIGADO: ligar com WELCOME_EMAIL_ENABLED=1 no Railway só
+// depois de uma compra de teste confirmar o aspeto. As duas URLs são
+// configuráveis por env para não mexer no código:
+//  - CHROME_STORE_URL: link de instalação da extensão. Enquanto a extensão não
+//    estiver na Chrome Web Store, fica a apontar para o site (carscore.pt).
+//  - WELCOME_LOGO_URL: imagem do logótipo no cabeçalho do email.
+const WELCOME_EMAIL_ENABLED = process.env.WELCOME_EMAIL_ENABLED === '1'
+                           || process.env.WELCOME_EMAIL_ENABLED === 'true';
+const CHROME_STORE_URL  = process.env.CHROME_STORE_URL  || 'https://carscore.pt';
+const WELCOME_LOGO_URL  = process.env.WELCOME_LOGO_URL  || 'https://carscore.pt/carscore-icon.png';
+const WELCOME_EMAIL_FROM = process.env.WELCOME_EMAIL_FROM || 'Carscore <geral@carscore.pt>';
+
 function lemonConfigOk() {
   return LEMON_STORE_ID != null && LEMON_PRODUCT_ID != null;
 }
@@ -1034,7 +1047,112 @@ async function pedidoTemLicenca(req) {
   return !!r.json.valid && lk.status !== 'disabled' && lk.status !== 'expired';
 }
 
+// Envia o email de boas-vindas (HTML com a marca) via Resend. Devolve true se
+// saiu, false caso contrário. Nunca atira — o webhook não deve falhar (e pedir
+// retry à Lemon) só porque um email não saiu.
+async function enviarEmailBoasVindas({ email, nome, chave, lugares }) {
+  const resendKey = process.env.RESEND_API_KEY;
+  if (!resendKey || !email || !chave) return false;
 
+  const ola = nome ? `Olá, ${nome},` : 'Olá,';
+  const lugaresTxt = lugares
+    ? `Subscrição para ${lugares} ${lugares == 1 ? 'lugar' : 'lugares'}.`
+    : '';
+  const portalUrl = 'https://app.lemonsqueezy.com/my-orders';
+
+  // Versão em texto simples (fallback p/ clientes sem HTML + melhor entrega).
+  const texto =
+`${ola}
+
+Obrigado por subscrever à Carscore. A subscrição está ativa e o período de avaliação de 14 dias já começou.
+
+A sua chave de licença:
+${chave}
+${lugaresTxt}
+
+Como começar:
+1. Instalar a extensão Carscore no Google Chrome: ${CHROME_STORE_URL}
+2. Carregar no ícone da extensão e abrir o menu.
+3. Colar a chave acima no campo da chave e guardar.
+
+A partir daí, o cálculo de importação aparece diretamente nos anúncios do Mobile.de, AutoScout24 e StandVirtual.
+
+Para gerir lugares, faturação ou cancelar: ${portalUrl}
+Qualquer dúvida: geral@carscore.pt
+
+Carscore · carscore.pt`;
+
+  const passo = (n, t) =>
+`<tr><td style="padding:0 0 12px;"><table role="presentation" cellpadding="0" cellspacing="0"><tr>
+<td valign="top" style="width:28px;"><div style="width:24px;height:24px;border-radius:50%;background:#1B3A6B;color:#ffffff;font-size:13px;line-height:24px;text-align:center;font-family:Arial,sans-serif;">${n}</div></td>
+<td style="padding-left:12px;font-family:Arial,sans-serif;font-size:14px;line-height:1.5;color:#333333;">${t}</td>
+</tr></table></td></tr>`;
+
+  const html =
+`<!DOCTYPE html><html lang="pt"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"></head>
+<body style="margin:0;padding:0;background:#eef0f3;">
+<table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="background:#eef0f3;padding:24px 0;"><tr><td align="center">
+<table role="presentation" width="520" cellpadding="0" cellspacing="0" style="max-width:520px;width:100%;background:#ffffff;border-radius:10px;overflow:hidden;">
+  <tr><td style="background:#1B3A6B;padding:22px 28px;">
+    <table role="presentation" cellpadding="0" cellspacing="0"><tr>
+      <td style="width:34px;"><img src="${WELCOME_LOGO_URL}" alt="Carscore" width="28" height="28" style="display:block;border:0;"></td>
+      <td style="padding-left:10px;color:#ffffff;font-family:Arial,sans-serif;font-size:20px;font-weight:bold;">Carscore</td>
+    </tr></table>
+  </td></tr>
+  <tr><td style="height:3px;background:#D4A017;font-size:0;line-height:0;">&nbsp;</td></tr>
+  <tr><td style="padding:28px;">
+    <p style="margin:0 0 14px;font-family:Arial,sans-serif;font-size:16px;color:#1a1a1a;">${ola}</p>
+    <p style="margin:0 0 18px;font-family:Arial,sans-serif;font-size:15px;line-height:1.6;color:#333333;">Obrigado por subscrever à Carscore. A subscrição está ativa e o período de avaliação de 14 dias já começou.</p>
+    <p style="margin:0 0 8px;font-family:Arial,sans-serif;font-size:13px;color:#666666;">A sua chave de licença</p>
+    <div style="background:#F1EFE8;border:1px solid #D3D1C7;border-radius:8px;padding:14px;text-align:center;font-family:'Courier New',monospace;font-size:15px;color:#1B3A6B;letter-spacing:1px;word-break:break-all;">${chave}</div>
+    <p style="margin:6px 0 24px;font-family:Arial,sans-serif;font-size:13px;color:#888888;">${lugaresTxt}</p>
+    <p style="margin:0 0 14px;font-family:Arial,sans-serif;font-size:16px;font-weight:bold;color:#1B3A6B;">Como começar</p>
+    <table role="presentation" cellpadding="0" cellspacing="0" width="100%">
+      ${passo(1, 'Instalar a extensão Carscore no Google Chrome.')}
+      ${passo(2, 'Carregar no ícone da extensão e abrir o menu.')}
+      ${passo(3, 'Colar a chave acima no campo da chave e guardar.')}
+    </table>
+    <table role="presentation" cellpadding="0" cellspacing="0" width="100%"><tr><td align="center" style="padding:10px 0 22px;">
+      <a href="${CHROME_STORE_URL}" style="display:inline-block;background:#1B3A6B;color:#ffffff;font-family:Arial,sans-serif;font-size:15px;font-weight:bold;text-decoration:none;padding:13px 30px;border-radius:8px;">Instalar a extensão</a>
+    </td></tr></table>
+    <p style="margin:0 0 22px;font-family:Arial,sans-serif;font-size:14px;line-height:1.6;color:#555555;">A partir daí, o cálculo de importação aparece diretamente nos anúncios do Mobile.de, AutoScout24 e StandVirtual.</p>
+    <table role="presentation" cellpadding="0" cellspacing="0" width="100%"><tr><td style="border-top:1px solid #eeeeee;padding-top:16px;">
+      <p style="margin:0 0 6px;font-family:Arial,sans-serif;font-size:13px;color:#666666;">Para gerir lugares, faturação ou cancelar: <a href="${portalUrl}" style="color:#185FA5;text-decoration:none;">gerir subscrição</a>.</p>
+      <p style="margin:0;font-family:Arial,sans-serif;font-size:13px;color:#666666;">Qualquer dúvida: <a href="mailto:geral@carscore.pt" style="color:#185FA5;text-decoration:none;">geral@carscore.pt</a></p>
+    </td></tr></table>
+  </td></tr>
+  <tr><td style="background:#F7F6F2;padding:16px 28px;text-align:center;">
+    <p style="margin:0;font-family:Arial,sans-serif;font-size:12px;color:#999999;">Carscore · carscore.pt</p>
+  </td></tr>
+</table>
+</td></tr></table>
+</body></html>`;
+
+  try {
+    const resp = await fetch('https://api.resend.com/emails', {
+      method: 'POST',
+      headers: { 'Authorization': 'Bearer ' + resendKey, 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        from: WELCOME_EMAIL_FROM,
+        to: email,
+        subject: 'Bem-vindo à Carscore — a sua chave de licença',
+        html,
+        text: texto,
+      }),
+    });
+    if (!resp.ok) {
+      const detalhe = await resp.text().catch(() => '');
+      console.error('[boas-vindas] Resend recusou', resp.status, detalhe);
+      return false;
+    }
+    return true;
+  } catch (e) {
+    console.error('[boas-vindas] erro a enviar', e.message);
+    return false;
+  }
+}
+
+// Lê o corpo CRU do pedido (sem fazer JSON.parse) — preciso para a assinatura,
 // porque o HMAC tem de bater com os bytes exatos que a Lemon enviou.
 function readRawBody(req) {
   return new Promise((resolve, reject) => {
@@ -2335,6 +2453,7 @@ const server = http.createServer(async (req, res) => {
       for (const k of minhas) {
         const keyStr = k.attributes && k.attributes.key;
         if (!keyStr) continue;
+        const prev = data.subscriptions[keyStr] || {};
         data.subscriptions[keyStr] = {
           status:        attrs.status || null,        // on_trial | active | cancelled | expired | past_due | paused | unpaid
           trial_ends_at: attrs.trial_ends_at || null, // fim do período de avaliação
@@ -2342,6 +2461,7 @@ const server = http.createServer(async (req, res) => {
           ends_at:       attrs.ends_at || null,       // data em que termina (definida se cancelada)
           cancelled:     !!attrs.cancelled,           // cancelou (mas pode ainda ter acesso até ends_at)
           quantity:      quantity,                    // nº de lugares
+          welcome_sent:  prev.welcome_sent || false,  // boas-vindas já enviadas? (preservar em retry/update)
           updated_at:    new Date().toISOString(),
         };
       }
@@ -2358,6 +2478,31 @@ const server = http.createServer(async (req, res) => {
         }
         console.log(`[lemon-webhook] ${event}: chave ${k.id} → activation_limit=${quantity} (order ${orderId})`);
       }
+
+      // 4) Email de boas-vindas — SÓ na criação da subscrição, UMA vez por chave.
+      //    (Atrás do interruptor WELCOME_EMAIL_ENABLED; nasce desligado.)
+      //    Enviado depois de tudo o resto correr bem, para nunca pedir retry à
+      //    Lemon por causa de um email; marca welcome_sent para não duplicar.
+      if (WELCOME_EMAIL_ENABLED && event === 'subscription_created') {
+        const email = attrs.user_email || null;
+        const nome  = (attrs.user_name || '').toString().split(' ')[0] || null;
+        const d2 = loadData();
+        let mudou = false;
+        for (const k of minhas) {
+          const keyStr = k.attributes && k.attributes.key;
+          if (!keyStr) continue;
+          const sub = d2.subscriptions[keyStr];
+          if (!sub || sub.welcome_sent) continue;        // já enviada → saltar
+          const saiu = await enviarEmailBoasVindas({ email, nome, chave: keyStr, lugares: quantity });
+          if (saiu) {
+            sub.welcome_sent = true;
+            mudou = true;
+            console.log(`[boas-vindas] enviado p/ ${email} (chave ${k.id})`);
+          }
+        }
+        if (mudou) saveData(d2);
+      }
+
       return ok(res, { ok: true, updated: minhas.length, quantity });
     } catch (e) {
       console.error('[lemon-webhook] erro', e.message);
