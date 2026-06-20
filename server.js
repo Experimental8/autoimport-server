@@ -1072,8 +1072,9 @@ ${lugaresTxt}
 
 Como começar:
 1. Instalar a extensão Carscore no Google Chrome: ${CHROME_STORE_URL}
-2. Carregar no ícone da extensão e abrir o menu.
-3. Colar a chave acima no campo da chave e guardar.
+2. Afixar a Carscore na barra do Chrome (ícone das extensões → fixar a Carscore).
+3. Abrir um anúncio no Mobile.de, AutoScout24 ou StandVirtual — na primeira utilização aparece a configuração inicial.
+4. No último ecrã da configuração, colar a chave acima e concluir (despesas de legalização e transporte). A chave também pode ser colada a qualquer momento na janela da extensão.
 
 A partir daí, o cálculo de importação aparece diretamente nos anúncios do Mobile.de, AutoScout24 e StandVirtual.
 
@@ -1089,31 +1090,32 @@ Carscore · carscore.pt`;
 </tr></table></td></tr>`;
 
   const html =
-`<!DOCTYPE html><html lang="pt"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"></head>
+`<!DOCTYPE html><html lang="pt"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><meta name="color-scheme" content="light only"><meta name="supported-color-schemes" content="light"><style>:root{color-scheme:light only;supported-color-schemes:light;}</style></head>
 <body style="margin:0;padding:0;background:#eef0f3;">
-<table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="background:#eef0f3;padding:24px 0;"><tr><td align="center">
-<table role="presentation" width="520" cellpadding="0" cellspacing="0" style="max-width:520px;width:100%;background:#ffffff;border-radius:10px;overflow:hidden;">
-  <tr><td style="background:#1B3A6B;padding:22px 28px;">
+<table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="background:#eef0f3 !important;padding:24px 0;"><tr><td align="center">
+<table role="presentation" width="520" cellpadding="0" cellspacing="0" style="max-width:520px;width:100%;background:#ffffff !important;border-radius:10px;overflow:hidden;">
+  <tr><td style="background:#1B3A6B !important;padding:22px 28px;">
     <table role="presentation" cellpadding="0" cellspacing="0"><tr>
       <td style="width:34px;"><img src="${WELCOME_LOGO_URL}" alt="Carscore" width="28" height="28" style="display:block;border:0;"></td>
-      <td style="padding-left:10px;color:#ffffff;font-family:Arial,sans-serif;font-size:20px;font-weight:bold;">Carscore</td>
+      <td style="padding-left:10px;color:#ffffff !important;font-family:Arial,sans-serif;font-size:20px;font-weight:bold;">Carscore</td>
     </tr></table>
   </td></tr>
-  <tr><td style="height:3px;background:#D4A017;font-size:0;line-height:0;">&nbsp;</td></tr>
+  <tr><td style="height:3px;background:#D4A017 !important;font-size:0;line-height:0;">&nbsp;</td></tr>
   <tr><td style="padding:28px;">
     <p style="margin:0 0 14px;font-family:Arial,sans-serif;font-size:16px;color:#1a1a1a;">${ola}</p>
     <p style="margin:0 0 18px;font-family:Arial,sans-serif;font-size:15px;line-height:1.6;color:#333333;">Obrigado por subscrever à Carscore. A subscrição está ativa e o período de avaliação de 14 dias já começou.</p>
     <p style="margin:0 0 8px;font-family:Arial,sans-serif;font-size:13px;color:#666666;">A sua chave de licença</p>
-    <div style="background:#F1EFE8;border:1px solid #D3D1C7;border-radius:8px;padding:14px;text-align:center;font-family:'Courier New',monospace;font-size:15px;color:#1B3A6B;letter-spacing:1px;word-break:break-all;">${chave}</div>
+    <div style="background:#F1EFE8 !important;border:1px solid #D3D1C7;border-radius:8px;padding:14px;text-align:center;font-family:'Courier New',monospace;font-size:15px;color:#1B3A6B !important;letter-spacing:1px;word-break:break-all;">${chave}</div>
     <p style="margin:6px 0 24px;font-family:Arial,sans-serif;font-size:13px;color:#888888;">${lugaresTxt}</p>
     <p style="margin:0 0 14px;font-family:Arial,sans-serif;font-size:16px;font-weight:bold;color:#1B3A6B;">Como começar</p>
     <table role="presentation" cellpadding="0" cellspacing="0" width="100%">
-      ${passo(1, 'Instalar a extensão Carscore no Google Chrome.')}
-      ${passo(2, 'Carregar no ícone da extensão e abrir o menu.')}
-      ${passo(3, 'Colar a chave acima no campo da chave e guardar.')}
+      ${passo(1, 'Instalar a extensão Carscore no Google Chrome (botão abaixo).')}
+      ${passo(2, 'Afixar a Carscore na barra do Chrome — carregar no ícone das extensões (peça de puzzle) e fixar a Carscore, para a ter sempre à vista.')}
+      ${passo(3, 'Abrir um anúncio no Mobile.de, AutoScout24 ou StandVirtual. Na primeira utilização, a Carscore mostra a configuração inicial.')}
+      ${passo(4, 'No último ecrã da configuração, colar a chave acima e concluir (despesas de legalização e transporte). A chave também pode ser colada a qualquer momento na janela da extensão.')}
     </table>
     <table role="presentation" cellpadding="0" cellspacing="0" width="100%"><tr><td align="center" style="padding:10px 0 22px;">
-      <a href="${CHROME_STORE_URL}" style="display:inline-block;background:#1B3A6B;color:#ffffff;font-family:Arial,sans-serif;font-size:15px;font-weight:bold;text-decoration:none;padding:13px 30px;border-radius:8px;">Instalar a extensão</a>
+      <a href="${CHROME_STORE_URL}" style="display:inline-block;background:#1B3A6B !important;color:#ffffff !important;font-family:Arial,sans-serif;font-size:15px;font-weight:bold;text-decoration:none;padding:13px 30px;border-radius:8px;">Instalar a extensão</a>
     </td></tr></table>
     <p style="margin:0 0 22px;font-family:Arial,sans-serif;font-size:14px;line-height:1.6;color:#555555;">A partir daí, o cálculo de importação aparece diretamente nos anúncios do Mobile.de, AutoScout24 e StandVirtual.</p>
     <table role="presentation" cellpadding="0" cellspacing="0" width="100%"><tr><td style="border-top:1px solid #eeeeee;padding-top:16px;">
