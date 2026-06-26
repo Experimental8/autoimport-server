@@ -110,7 +110,7 @@ async function notify(channel, title, message, priority = 'default', analysisId 
       const fullMessage = subtitle ? `${subtitle}\n${'─'.repeat(20)}\n${message}` : message;
       await fetch(`https://ntfy.sh/${channel}`, {
         method: 'POST',
-        headers: { 'Title': encodeNtfyHeader(title), 'Priority': priority, 'Tags': 'car,autoimport' },
+        headers: { 'Title': encodeNtfyHeader(title), 'Priority': priority, 'Tags': 'car,carscore' },
         body: fullMessage,
       });
     } catch (e) { console.error('ntfy error:', e.message); }
