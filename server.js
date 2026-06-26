@@ -1050,7 +1050,7 @@ async function pedidoTemLicenca(req) {
 // Envia o email de boas-vindas (HTML com a marca) via Resend. Devolve true se
 // saiu, false caso contrário. Nunca atira — o webhook não deve falhar (e pedir
 // retry à Lemon) só porque um email não saiu.
-async function enviarEmailBoasVindas({ email, nome, chave, lugares }) {
+async function enviarEmailBoasVindas({ email, nome, chave, lugares, portalUrl }) {
   const resendKey = process.env.RESEND_API_KEY;
   if (!resendKey || !email || !chave) return false;
 
@@ -1058,7 +1058,10 @@ async function enviarEmailBoasVindas({ email, nome, chave, lugares }) {
   const lugaresTxt = lugares
     ? `Subscrição para ${lugares} ${lugares == 1 ? 'lugar' : 'lugares'}.`
     : '';
-  const portalUrl = 'https://app.lemonsqueezy.com/my-orders';
+  // portalUrl = link ASSINADO do Customer Portal (attrs.urls.customer_portal),
+  // per-cliente e válido ~24h, injetado pelo webhook. Se não vier, omitimos a
+  // referência ao portal em vez de mostrar um link genérico (decisão do João).
+  const temPortal = !!portalUrl;
   const lugaresParen = lugares ? ` (${lugares} ${lugares == 1 ? 'lugar' : 'lugares'})` : '';
 
   // Versão em texto simples (fallback p/ clientes sem HTML + melhor entrega).
@@ -1072,18 +1075,17 @@ ${chave}
 ${lugaresTxt}
 
 Como começar:
-1. Instalar a extensão Carscore no Google Chrome: ${CHROME_STORE_URL}
-2. Afixar a Carscore na barra do Chrome (ícone das extensões → fixar a Carscore).
-3. Abrir um anúncio no Mobile.de, AutoScout24 ou StandVirtual — na primeira utilização aparece a configuração inicial.
-4. No último ecrã da configuração, colar a chave acima e concluir (despesas de legalização e transporte). A chave também pode ser colada a qualquer momento na janela da extensão.
+1. Instalar a extensão Carscore no Google Chrome (${CHROME_STORE_URL}) e afixá-la na barra do Chrome (ícone das extensões → fixar a Carscore).
+2. Abrir um anúncio num dos sites onde a Carscore funciona: Mobile.de, AutoScout24 ou StandVirtual.
+3. Concluir a configuração inicial (despesas de transporte e legalização) e, no fim, colar a chave acima.
+4. Seguir o tutorial de utilização — e fica pronto a funcionar.
 
 A partir daí, o cálculo de importação aparece diretamente nos anúncios do Mobile.de, AutoScout24 e StandVirtual.
 
 O seu período de avaliação
-Tem 14 dias de avaliação com acesso completo. Não é cobrado nada durante este período. Ao fim dos 14 dias, a subscrição inicia-se automaticamente no plano escolhido${lugaresParen}, salvo cancelamento até essa data. Pode gerir ou cancelar a subscrição a qualquer momento no portal de cliente: ${portalUrl}
+Tem 14 dias de avaliação com acesso completo. Não é cobrado nada durante este período. Ao fim dos 14 dias, a subscrição inicia-se automaticamente no plano escolhido${lugaresParen}, salvo cancelamento até essa data.${temPortal ? ` Pode gerir ou cancelar a subscrição a qualquer momento no portal de cliente: ${portalUrl}` : ''}
 
-Para gerir lugares, faturação ou cancelar: ${portalUrl}
-Qualquer dúvida: geral@carscore.pt
+${temPortal ? `Para gerir lugares, faturação ou cancelar: ${portalUrl}\n` : ''}Qualquer dúvida: geral@carscore.pt
 
 Carscore · carscore.pt`;
 
@@ -1113,10 +1115,10 @@ Carscore · carscore.pt`;
     <p style="margin:6px 0 24px;font-family:Arial,sans-serif;font-size:13px;color:#888888;">${lugaresTxt}</p>
     <p style="margin:0 0 14px;font-family:Arial,sans-serif;font-size:16px;font-weight:bold;color:#1B3A6B;">Como começar</p>
     <table role="presentation" cellpadding="0" cellspacing="0" width="100%">
-      ${passo(1, 'Instalar a extensão Carscore no Google Chrome (botão abaixo).')}
-      ${passo(2, 'Afixar a Carscore na barra do Chrome — carregar no ícone das extensões (peça de puzzle) e fixar a Carscore, para a ter sempre à vista.')}
-      ${passo(3, 'Abrir um anúncio no Mobile.de, AutoScout24 ou StandVirtual. Na primeira utilização, a Carscore mostra a configuração inicial.')}
-      ${passo(4, 'No último ecrã da configuração, colar a chave acima e concluir (despesas de legalização e transporte). A chave também pode ser colada a qualquer momento na janela da extensão.')}
+      ${passo(1, 'Instalar a extensão Carscore no Google Chrome (botão abaixo) e afixá-la na barra — ícone das extensões (peça de puzzle) → fixar a Carscore.')}
+      ${passo(2, 'Abrir um anúncio num dos sites onde a Carscore funciona: Mobile.de, AutoScout24 ou StandVirtual.')}
+      ${passo(3, 'Concluir a configuração inicial (despesas de transporte e legalização) e, no fim, colar a chave acima.')}
+      ${passo(4, 'Seguir o tutorial de utilização — e fica pronto a funcionar.')}
     </table>
     <table role="presentation" cellpadding="0" cellspacing="0" width="100%"><tr><td align="center" style="padding:10px 0 22px;">
       <a href="${CHROME_STORE_URL}" style="display:inline-block;background:#1B3A6B !important;color:#ffffff !important;font-family:Arial,sans-serif;font-size:15px;font-weight:bold;text-decoration:none;padding:13px 30px;border-radius:8px;">Instalar a extensão</a>
@@ -1124,11 +1126,11 @@ Carscore · carscore.pt`;
     <p style="margin:0 0 22px;font-family:Arial,sans-serif;font-size:14px;line-height:1.6;color:#555555;">A partir daí, o cálculo de importação aparece diretamente nos anúncios do Mobile.de, AutoScout24 e StandVirtual.</p>
     <table role="presentation" cellpadding="0" cellspacing="0" width="100%"><tr><td style="background:#F4F6F9;border:1px solid #E2E8F0;border-radius:8px;padding:16px 18px;">
       <p style="margin:0 0 8px;font-family:Arial,sans-serif;font-size:14px;font-weight:bold;color:#1B3A6B;">O seu período de avaliação</p>
-      <p style="margin:0;font-family:Arial,sans-serif;font-size:13px;line-height:1.6;color:#555555;">Tem 14 dias de avaliação com acesso completo. Não é cobrado nada durante este período. Ao fim dos 14 dias, a subscrição inicia-se automaticamente no plano escolhido${lugaresParen}, salvo cancelamento até essa data. Pode gerir ou cancelar a subscrição a qualquer momento no <a href="${portalUrl}" style="color:#185FA5;text-decoration:none;">portal de cliente</a>.</p>
+      <p style="margin:0;font-family:Arial,sans-serif;font-size:13px;line-height:1.6;color:#555555;">Tem 14 dias de avaliação com acesso completo. Não é cobrado nada durante este período. Ao fim dos 14 dias, a subscrição inicia-se automaticamente no plano escolhido${lugaresParen}, salvo cancelamento até essa data.${temPortal ? ` Pode gerir ou cancelar a subscrição a qualquer momento no <a href="${portalUrl}" style="color:#185FA5;text-decoration:none;">portal de cliente</a>.` : ''}</p>
     </td></tr></table>
     <table role="presentation" cellpadding="0" cellspacing="0" width="100%"><tr><td style="height:22px;line-height:22px;font-size:0;">&nbsp;</td></tr></table>
     <table role="presentation" cellpadding="0" cellspacing="0" width="100%"><tr><td style="border-top:1px solid #eeeeee;padding-top:16px;">
-      <p style="margin:0 0 6px;font-family:Arial,sans-serif;font-size:13px;color:#666666;">Para gerir lugares, faturação ou cancelar: <a href="${portalUrl}" style="color:#185FA5;text-decoration:none;">gerir subscrição</a>.</p>
+      ${temPortal ? `<p style="margin:0 0 6px;font-family:Arial,sans-serif;font-size:13px;color:#666666;">Para gerir lugares, faturação ou cancelar: <a href="${portalUrl}" style="color:#185FA5;text-decoration:none;">gerir subscrição</a>.</p>` : ''}
       <p style="margin:0;font-family:Arial,sans-serif;font-size:13px;color:#666666;">Qualquer dúvida: <a href="mailto:geral@carscore.pt" style="color:#185FA5;text-decoration:none;">geral@carscore.pt</a></p>
     </td></tr></table>
   </td></tr>
@@ -2497,6 +2499,9 @@ const server = http.createServer(async (req, res) => {
       if (WELCOME_EMAIL_ENABLED && event === 'subscription_created') {
         const email = attrs.user_email || null;
         const nome  = (attrs.user_name || '').toString().split(' ')[0] || null;
+        // Link ASSINADO do Customer Portal (per-cliente, ~24h). Vem no objeto da
+        // subscrição; é o mesmo tipo de link que a Lemon usa nos emails dela.
+        const portalUrl = (attrs.urls && attrs.urls.customer_portal) || null;
         const d2 = loadData();
         let mudou = false;
         for (const k of minhas) {
@@ -2504,7 +2509,7 @@ const server = http.createServer(async (req, res) => {
           if (!keyStr) continue;
           const sub = d2.subscriptions[keyStr];
           if (!sub || sub.welcome_sent) continue;        // já enviada → saltar
-          const saiu = await enviarEmailBoasVindas({ email, nome, chave: keyStr, lugares: quantity });
+          const saiu = await enviarEmailBoasVindas({ email, nome, chave: keyStr, lugares: quantity, portalUrl });
           if (saiu) {
             sub.welcome_sent = true;
             mudou = true;
