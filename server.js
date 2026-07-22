@@ -1,4 +1,4 @@
-const cron  = require('node-cron');
+// (node-cron removido em 2026-07-22 — ver nota do cron no fim do ficheiro.)
 const fetch = require('node-fetch');
 const fs    = require('fs');
 const http  = require('http');
@@ -858,7 +858,7 @@ function readBody(req) {
   });
 }
 function ok(res, data)       { res.writeHead(200); res.end(JSON.stringify(data)); }
-function err(res, msg, c=400){ res.writeHead(c);   res.end(JSON.stringify({ error: msg })); }
+function err(res, msg, c=400, extra){ res.writeHead(c);   res.end(JSON.stringify(Object.assign({ error: msg }, extra || {}))); }
 
 // Tokeniza uma string em Set de tokens normalizados (lowercase, sem acentos,
 // só alfanuméricos, length >= 2, sem stopwords PT + automotive + technical).
@@ -1014,17 +1014,31 @@ function lemonWebhookValido(rawBody, signature) {
 // deixa passar. Isto é um travão CONTRA ABUSO, não uma fortaleza — vale mais
 // nunca trancar um cliente legítimo por uma corrida/soluço de rede do que
 // apertar ao máximo. (O cálculo central corre no cliente; ver nota na lista.)
-async function pedidoTemLicenca(req) {
-  if (!lemonConfigOk()) return true;                  // licenciamento não configurado → não trancar
+// Mensagens por motivo de recusa. O código curto (`motivo`) vai na resposta 403
+// para a extensão poder mostrar a mensagem certa: "chave errada" e "subscrição
+// acabou" pedem ações opostas (colar outra chave vs. regularizar o pagamento).
+const MSG_LICENCA = {
+  sem_chave:          'Nenhuma chave de licença configurada.',
+  chave_desconhecida: 'Chave de licença não reconhecida.',
+  outra_loja:         'Esta chave de licença não pertence à Carscore.',
+  subscricao_inativa: 'Subscrição terminada ou inativa.',
+  chave_desativada:   'Chave de licença desativada.'
+};
+
+// Devolve NULL quando o pedido pode passar, ou um código de MSG_LICENCA quando
+// deve ser recusado. (Antes chamava-se `pedidoTemLicenca` e devolvia booleano;
+// passou a devolver o motivo em 2026-07-22 para o utilizador saber o que fazer.)
+async function motivoRecusaLicenca(req) {
+  if (!lemonConfigOk()) return null;                  // licenciamento não configurado → não trancar
   const key = (req.headers['x-license-key'] || '').toString().trim();
-  if (!key) return false;                             // sem chave → sem acesso
+  if (!key) return 'sem_chave';                       // sem chave → sem acesso
 
   let r;
   try { r = await lemonLicenseCall('validate', { license_key: key }); }
-  catch (e) { return true; }                          // falha de rede → não trancar
-  if (!r.json) return true;                           // resposta ilegível → não trancar
-  if (!r.json.meta) return false;                     // chave desconhecida → sem acesso
-  if (!lemonPertenceAMim(r.json.meta)) return false;  // chave de OUTRA loja → sem acesso
+  catch (e) { return null; }                          // falha de rede → não trancar
+  if (!r.json) return null;                           // resposta ilegível → não trancar
+  if (!r.json.meta) return 'chave_desconhecida';      // chave desconhecida → sem acesso
+  if (!lemonPertenceAMim(r.json.meta)) return 'outra_loja'; // chave de OUTRA loja → sem acesso
 
   const agora = Date.now();
   const noFuturo = (iso) => {
@@ -1035,16 +1049,30 @@ async function pedidoTemLicenca(req) {
   // Estado da subscrição guardado pelo webhook (traz as datas do trial).
   const sub = (loadData().subscriptions || {})[key] || null;
   if (sub) {
-    if (sub.status === 'active') return true;
-    if (sub.status === 'on_trial' && sub.trial_ends_at && noFuturo(sub.trial_ends_at)) return true;
-    if (sub.cancelled && sub.ends_at && noFuturo(sub.ends_at)) return true; // cancelou mas ainda pago
-    return false;                                     // registo existe mas não dá acesso (expirado/terminado)
+    if (sub.status === 'active') return null;
+    if (sub.status === 'on_trial' && sub.trial_ends_at && noFuturo(sub.trial_ends_at)) return null;
+    if (sub.cancelled && sub.ends_at && noFuturo(sub.ends_at)) return null; // cancelou mas ainda pago
+    return 'subscricao_inativa';                      // registo existe mas não dá acesso (expirado/terminado)
   }
 
   // Ainda sem registo de webhook (corrida com a criação) → confiar no estado
   // da CHAVE: legítima e não desativada/expirada.
   const lk = r.json.license_key || {};
-  return !!r.json.valid && lk.status !== 'disabled' && lk.status !== 'expired';
+  const chaveBoa = !!r.json.valid && lk.status !== 'disabled' && lk.status !== 'expired';
+  return chaveBoa ? null : 'chave_desativada';
+}
+
+// Aplica o portão num endpoint pago. Devolve true se JÁ respondeu 403 (o
+// handler deve terminar) e false se o pedido pode seguir. Regista sempre o
+// motivo — sem isto, uma recusa era indistinguível nos logs de uma pesquisa
+// sem resultados (custou um diagnóstico longo a 2026-07-22).
+async function recusarSemLicenca(req, res, caminho) {
+  if (!LICENSE_GATE_ENABLED) return false;
+  const motivo = await motivoRecusaLicenca(req);
+  if (!motivo) return false;
+  console.log('[gate] 403', caminho, '→', motivo);
+  err(res, MSG_LICENCA[motivo] || 'Subscrição necessária', 403, { motivo });
+  return true;
 }
 
 // Envia o email de boas-vindas (HTML com a marca) via Resend. Devolve true se
@@ -1475,9 +1503,7 @@ const server = http.createServer(async (req, res) => {
   // qualquer outro código de erro recorre ao plano B (copiar para a área de
   // transferência). Por isso devolvemos 200 só quando o email saiu mesmo.
   if (req.method === 'POST' && u.pathname === '/bug-report') {
-    if (LICENSE_GATE_ENABLED && !(await pedidoTemLicenca(req))) {
-      return err(res, 'Subscrição necessária', 403);
-    }
+    if (await recusarSemLicenca(req, res, u.pathname)) return;
     try {
       const body = await readBody(req);
       const assunto = (body.assunto || '').trim();
@@ -1706,9 +1732,7 @@ const server = http.createServer(async (req, res) => {
   // 1) Cache-first (mesmo matching da B2B → consistência total, custo zero)
   // 2) Cache-miss → IA (Anthropic), 3) guarda de volta na cache partilhada.
   if (req.method === 'POST' && u.pathname === '/co2-suggest') {
-    if (LICENSE_GATE_ENABLED && !(await pedidoTemLicenca(req))) {
-      return err(res, 'Subscrição necessária', 403);
-    }
+    if (await recusarSemLicenca(req, res, u.pathname)) return;
     try {
       const b = await readBody(req);
       const marca = (b.marca || '').toString().trim();
@@ -1908,6 +1932,7 @@ const server = http.createServer(async (req, res) => {
       // Sem chave Brave OU sem qualquer resultado → NÃO chamar a IA.
       // Devolve "sem-info": a extensão fica só com o preenchimento manual.
       if (!trechos.length) {
+        console.log('[co2-suggest]', marca, modelo, ano, fuelNorm, '→ trechos: 0 (sem-info)');
         return ok(res, {
           co2: 0, autonomia: 0, fonte: 'sem-info',
           nota: 'Sem informação web suficiente — preenche à mão (valor do COC).'
@@ -2163,9 +2188,7 @@ const server = http.createServer(async (req, res) => {
   //  - threshold de 80% para devolver match
   //  - desempate: mais anúncios activos, depois mais recente
   if (req.method === 'GET' && u.pathname === '/sv-analyses/lookup') {
-    if (LICENSE_GATE_ENABLED && !(await pedidoTemLicenca(req))) {
-      return err(res, 'Subscrição necessária', 403);
-    }
+    if (await recusarSemLicenca(req, res, u.pathname)) return;
     try {
       const tokensMarca = tokenizar(u.searchParams.get('marca') || '');
       const tokensModelo = tokenizar(u.searchParams.get('modelo') || '');
@@ -2531,20 +2554,12 @@ const server = http.createServer(async (req, res) => {
 
 const PORT = process.env.PORT || 3000;
 server.listen(PORT, () => console.log(`AutoImport server running on port ${PORT}`));
-// Sync às 12h e 17h30 — hora de Lisboa (PT). Sem `timezone` explícita,
-// node-cron usa o TZ do processo, que no Railway é UTC → no horário de verão
-// (CEST, UTC+1) os crons corriam 1h atrasados (08h Lisboa → 09h real).
-// Bug detectado em produção 2026-04-30: análise tinha cron das 12h a disparar às 13h.
-// Reduzido de 4× para 2×/dia em 2026-05-04 — menos custo Apify, mantém recovery diário.
-const syncTimes = ['0 12 * * *', '30 17 * * *'];
-syncTimes.forEach(expr => {
-  cron.schedule(expr, () => {
-    console.log(`⏰ Sync scheduled: ${expr}`);
-    syncAll().catch(console.error);
-  }, { timezone: 'Europe/Lisbon' });
-});
-console.log('✅ Cron: 12h, 17h30 (Europe/Lisbon) — todos os dias');
-
+// Cron de sync REMOVIDO em 2026-07-22: a plataforma B2B foi descontinuada e o
+// agendamento já só escrevia "No analyses to sync." nos logs. O sync continua
+// disponível À MÃO em POST /sync (nada foi apagado da lógica de sincronização).
+// Histórico: 4×/dia até 2026-05-04, depois 12h + 17h30 com `timezone`
+// 'Europe/Lisbon' explícita — sem ela, o TZ UTC do Railway atrasava os crons 1h
+// no horário de verão (bug apanhado em produção a 2026-04-30).
+//
 // Boot sync removido em 2026-05-04: cada deploy/restart não dispara mais Apify.
-// Se o servidor cair entre crons, o próximo cron agendado encarrega-se.
 // Histórico: até 2026-05-04-9 havia debounce de 6h; antes disso corria sempre no boot.
