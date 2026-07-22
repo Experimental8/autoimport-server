@@ -1783,10 +1783,18 @@ const server = http.createServer(async (req, res) => {
 
       // Fuel em inglês para queries de sites internacionais (carfolio,
       // automobile-catalog, evdatabase usam "diesel"/"petrol", não "gasóleo").
-      // PHEV/híbrido/elétrico ficam iguais (são palavras comuns em todas línguas).
-      const fuelEN = fuelNorm === 'gasóleo' ? 'diesel'
-                   : fuelNorm === 'gasolina' ? 'petrol'
-                   : fuelNorm;
+      // 2026-07-22: elétrico/híbrido/phev passaram TAMBÉM a ser traduzidos — o
+      // comentário antigo dizia que eram "palavras comuns a todas as línguas",
+      // mas iam para a query em português e com acento ("elétrico", "híbrido"),
+      // o que pesa contra fichas técnicas internacionais.
+      const FUEL_EN = {
+        'gasóleo':  'diesel',
+        'gasolina': 'petrol',
+        'elétrico': 'electric',
+        'híbrido':  'hybrid',
+        'phev':     'plug-in hybrid'
+      };
+      const fuelEN = FUEL_EN[fuelNorm] || fuelNorm;
       // Protocolo provável conforme regra UE (WLTP obrigatório desde 09/2018).
       // Carros 2018 ficam ambíguos: query genérica em vez de forçar protocolo.
       const protocoloProvavel = ano >= 2019 ? 'WLTP' : (ano <= 2017 ? 'NEDC' : '');
