@@ -1809,7 +1809,10 @@ const server = http.createServer(async (req, res) => {
         'matrix', 'navi', 'navigation', 'chrono', 'sportchrono', 'approved',
         'approvedfahig', 'garantie', 'garantia', 'scheckheft', 'voll',
         'vollausstattung', 'paket', 'packet', 'package', 'kamera', 'camera',
-        'leder', 'klima', 'memory', 'keyless', 'hud', 'acc'
+        'leder', 'klima', 'memory', 'keyless', 'hud', 'acc',
+        // 2026-07-22: extras que apareciam em títulos e afundavam a pesquisa.
+        // NÃO incluir tração (4matic/quattro/xdrive) — afeta o peso e o CO2.
+        'pano', 'panorama', 'digital-led', 'kam', 'amg'
       ]);
       const limparSubmodelo = (sub) => {
         return (sub || '').toString()
