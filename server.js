@@ -1943,7 +1943,8 @@ const server = http.createServer(async (req, res) => {
       // Sem chave Brave OU sem qualquer resultado → NÃO chamar a IA.
       // Devolve "sem-info": a extensão fica só com o preenchimento manual.
       if (!trechos.length) {
-        console.log('[co2-suggest]', marca, modelo, ano, fuelNorm, '→ trechos: 0 (sem-info)');
+        console.log('[co2-suggest] FALHA sem_web |', marca, modelo, ano, fuelNorm,
+                    b.pais_vendedor ? '('+b.pais_vendedor+')' : '', '→ 0 trechos');
         return ok(res, {
           co2: 0, autonomia: 0, fonte: 'sem-info',
           nota: 'Sem informação web suficiente — preenche à mão (valor do COC).'
@@ -2035,6 +2036,17 @@ const server = http.createServer(async (req, res) => {
       const norma = (parsed.norma === 'NEDC') ? 'NEDC' : 'WLTP';
       const confianca = ['alta', 'média', 'baixa'].includes(parsed.confianca) ? parsed.confianca : 'baixa';
       const nota = (parsed.nota || '').toString().slice(0, 200);
+
+      // Registo de falha "sem_valor": houve trechos, mas a IA não conseguiu tirar
+      // um valor fiável (co2 E autonomia a 0). É DIFERENTE de "sem_web": aqui o
+      // problema é de extração/interpretação, não de pesquisa. Junto com o
+      // "sem_web", dá uma lista de trabalho por `grep '\[co2-suggest\] FALHA'`.
+      // (Elétricos com autonomia > 0 e co2 0 são sucesso legítimo — não entram.)
+      if (co2 === 0 && autonomia === 0) {
+        console.log('[co2-suggest] FALHA sem_valor |', marca, modelo, ano, fuelNorm,
+                    b.pais_vendedor ? '('+b.pais_vendedor+')' : '',
+                    '→ trechos:', trechos.length, 'conf:', confianca);
+      }
 
       // 3) Guardar de volta na cache partilhada (grátis na próxima; ajuda a B2B).
       //    Chave no mesmo formato do cliente B2B: marca|modelo|subFirst|ano|fuel|pot
